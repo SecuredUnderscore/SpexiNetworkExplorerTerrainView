@@ -2,8 +2,9 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @match        https://explorer.spexi.com/*
+// @require      https://unpkg.com/h3-js@3.7.2/dist/h3-js.umd.js
 // @license      MIT
 // @grant        none
 // @run-at       document-start
