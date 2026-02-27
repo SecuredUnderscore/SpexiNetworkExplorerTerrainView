@@ -2,819 +2,858 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      3.0
 // @match        https://explorer.spexi.com/*
-// @require      https://unpkg.com/h3-js@3.7.2/dist/h3-js.umd.js
+// @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
+// @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
 // @license      MIT
 // @grant        none
 // @run-at       document-start
+// @description  Generate KML flight paths for Spexi Missions directly from the Explorer
+// @downloadURL https://update.greasyfork.org/scripts/533567/Spexi%20Network%20Explorer%20Tools.user.js
+// @updateURL https://update.greasyfork.org/scripts/533567/Spexi%20Network%20Explorer%20Tools.meta.js
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
-    // Destructure H3 functions
-    const { h3ToGeo, h3ToGeoBoundary } = h3;
+    // ─────────────────────────────────────────────────────────────────────────────
+    // User Settings & Dynamic Loading
+    // ─────────────────────────────────────────────────────────────────────────────
+    let DRONE_MODEL = "DJI Mini 3";
 
-    // Global state
-    let mapCounter = 0;
-    let lastZone = null;
-    let lastMissions = [];
+    let MAP_PARAMS = {
+        altitude: 80,
+        flap: 0.80,
+        slap: 0.70,
+        bearing: { mode: "relative", value: 0 },
+        gimbalPitch: -90,
+        gimbalPitchGrid: -60,
+    };
 
-    // Mapbox Map interception
-    function setupMapInterception() {
-        Object.defineProperty(Object.prototype, '_map', {
-            configurable: true,
-            set(val) {
-                if (
-                    val &&
-                    typeof val.getStyle === 'function' &&
-                    typeof val.setTerrain === 'function' &&
-                    typeof val.addSource === 'function'
-                ) {
-                    window.__spexMap = val;
-                    mapCounter += 1;
-                    const thisMapId = mapCounter;
-                    setTimeout(() => {
-                        if (mapCounter === thisMapId) {
-                            injectTerrainToggle();
-                        }
-                    }, 100);
-                }
-                Object.defineProperty(this, '_map', {
-                    value: val,
-                    writable: true,
-                    configurable: true
-                });
-            }
-        });
-    }
+    let PANO_PARAMS = {
+        altitude: 80,
+        speed: 10,
+        fov: 360,
+        overlap: 0.45,
+        gimbalPitches: [-60, -30]
+    };
 
-    // UI Modifications
-    function disableRowHover() {
-        const style = document.createElement('style');
-        style.textContent = `.c-cmpvrW tr:hover { background: transparent !important; }`;
-        document.head.appendChild(style);
-    }
-
-    function injectTerrainToggle() {
-        if (!window.__spexMap) return;
+    function loadSettings() {
         try {
-            const outer = document.querySelector('.PJLV.PJLV-ihFkYvu-css');
-            if (!outer) return;
-            const inner = outer.querySelector('.c-kiAJIg.c-kiAJIg-iTKOFX-dir-v.c-kiAJIg-fVlWzK-spacing-s');
-            if (!inner || inner.querySelector('[data-spexi-terrain-toggle]')) return;
+            let saved = localStorage.getItem("spexi_flight_settings");
+            if (saved) {
+                let s = JSON.parse(saved);
+                if (s.droneModel) DRONE_MODEL = s.droneModel;
+                if (s.altitude !== undefined) MAP_PARAMS.altitude = PANO_PARAMS.altitude = s.altitude;
+                if (s.gimbalPitch !== undefined) MAP_PARAMS.gimbalPitch = s.gimbalPitch;
+                if (s.gimbalPitchGrid !== undefined) MAP_PARAMS.gimbalPitchGrid = s.gimbalPitchGrid;
+                if (s.slap !== undefined) MAP_PARAMS.slap = s.slap;
+            }
+        } catch (e) { }
+    }
 
-            const btn = document.createElement('button');
-            btn.className = 'c-kSHLrh c-kSHLrh-eBJLUK-variant-neutral_solid c-kSHLrh-gAsrNz-size-m c-kSHLrh-fNianW-isCircle-true c-kSHLrh-kEvnuF-cv PJLV';
-            btn.textContent = '3D';
-            btn.dataset.spexiTerrainToggle = 'true';
-            let terrainEnabled = false;
+    function saveSettings(s) {
+        localStorage.setItem("spexi_flight_settings", JSON.stringify(s));
+        loadSettings();
+        let droneDisplay = document.getElementById("spexi-drone-info-text");
+        if (droneDisplay) droneDisplay.innerText = `Drone: ${DRONE_MODEL}`;
+    }
 
-            btn.onclick = () => {
-                const map = window.__spexMap;
-                if (!map) return console.error('Terrain toggle: map not ready');
+    loadSettings();
+
+    const DRONES = {
+        "DJI Mini 2": { model: "DJI Mini 2", cameraModel: "FC7303", sensorWidthInMeters: 0.0063, sensorHeightInMeters: 0.0047, pixelPitchInMeters: 1.6e-6, focalLengthInMeters: 0.0045, hFovInDegrees: 83.0 },
+        "DJI Mini 3": { model: "DJI Mini 3", cameraModel: "FC3682", sensorWidthInMeters: 0.01, sensorHeightInMeters: 0.0075, pixelPitchInMeters: 2.4e-6, focalLengthInMeters: 0.0067, hFovInDegrees: 82.1 },
+        "DJI Mini 3 Pro": { model: "DJI Mini 3 Pro", cameraModel: "FC3582", sensorWidthInMeters: 0.01, sensorHeightInMeters: 0.0075, pixelPitchInMeters: 2.4e-6, focalLengthInMeters: 0.0067, hFovInDegrees: 82.1 },
+        "DJI Mini 4 Pro": { model: "DJI Mini 4 Pro", cameraModel: "FC8482", sensorWidthInMeters: 0.01, sensorHeightInMeters: 0.0075, pixelPitchInMeters: 2.4e-6, focalLengthInMeters: 0.0067, hFovInDegrees: 82.1 }
+    };
+
+    const FLIGHT_PLAN_NAMES = { 1: "Map", 2: "Multi-Panorama", 3: "Panorama", 4: "Grid Map", 5: "Hybrid" };
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Math & Geometry
+    // ─────────────────────────────────────────────────────────────────────────────
+    function roundCoord(x) { return Math.round(x * 10000000) / 10000000; }
+    function roundAngle(x) { return Math.round(x * 1000) / 1000; }
+
+    function calcGsd(altitude, camera) { return (altitude / camera.focalLengthInMeters) * camera.pixelPitchInMeters; }
+    function calcGroundWidth(camera, gsd) { return (camera.sensorWidthInMeters / camera.pixelPitchInMeters) * gsd; }
+    function calcGroundHeight(camera, gsd) { return (camera.sensorHeightInMeters / camera.pixelPitchInMeters) * gsd; }
+    function calcLineSpacing(slap, camera, gsd) { return calcGroundWidth(camera, gsd) * (1 - slap); }
+    function calcPhotoInterval(camera, gsd, flap) { return calcGroundHeight(camera, gsd) * (1 - flap); }
+
+    function bearingBetween(pt1, pt2) { return (turf.bearing(pt1, pt2) + 360) % 360; }
+    function rhumbBearing(pt1, pt2) { return (turf.rhumbBearing(pt1, pt2) + 360) % 360; }
+    function distanceMeters(pt1, pt2) { return turf.distance(pt1, pt2, { units: 'meters' }); }
+
+    function pointAlongLine(p1, p2, fraction) {
+        return [p1[0] + (p2[0] - p1[0]) * fraction, p1[1] + (p2[1] - p1[1]) * fraction];
+    }
+
+    function rotateCoords(coords, angleDeg, pivot) {
+        if (angleDeg === 0) return coords.map(c => [...c]);
+        // Note: turf.transformRotate uses positive angle = clockwise. Default pivot is centroid.
+        // The script uses Rhumb rotation implicitly in Turf's transformRotate.
+        const line = turf.lineString(coords);
+        const rotated = turf.transformRotate(line, angleDeg, { pivot: pivot });
+        return rotated.geometry.coordinates;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // H3 / Generation Logic
+    // ─────────────────────────────────────────────────────────────────────────────
+    function getHexBoundary(hash) {
+        let b = h3.cellToBoundary(hash);
+        let coords = b.map(c => [c[1], c[0]]);
+        coords.push([...coords[0]]); // close ring
+        return coords;
+    }
+
+    function getHexCentroid(hash) {
+        let center = h3.cellToLatLng(hash);
+        return [center[1], center[0]];
+    }
+
+    function getLongestLineIndex(hexCoords) {
+        let maxDist = -1, maxIdx = 0;
+        for (let i = 0; i < hexCoords.length - 1; i++) {
+            let d = distanceMeters(hexCoords[i], hexCoords[i + 1]);
+            if (d > maxDist) { maxDist = d; maxIdx = i; }
+        }
+        return maxIdx;
+    }
+
+    function getHexPanos(hash) {
+        const center = getHexCentroid(hash);
+        const hexPoly = turf.polygon([getHexBoundary(hash)]);
+        const neighbors = h3.gridDisk(hash, 1);
+
+        let neighborCenters = [];
+        for (let n of neighbors) {
+            let ncList = h3.cellToLatLng(n);
+            let nc = [ncList[1], ncList[0]];
+            if (Math.abs(nc[0] - center[0]) < 1e-10 && Math.abs(nc[1] - center[1]) < 1e-10) continue;
+            let angle = Math.atan2(nc[1] - center[1], nc[0] - center[0]);
+            neighborCenters.push({ x: nc[0], y: nc[1], angle: angle });
+        }
+
+        // Match app logic: angles [0, 2PI)
+        for (let n of neighborCenters) { if (n.angle < 0) n.angle += 2 * Math.PI; }
+        neighborCenters.sort((a, b) => a.angle - b.angle);
+
+        const sorted = neighborCenters.map(n => [n.x, n.y]);
+        let panoPoints = [];
+        for (let i = 0; i < sorted.length; i++) {
+            let next_i = (i + 1) % sorted.length;
+            let triangleCoords = [center, sorted[i], sorted[next_i], center];
+            let triangle = turf.polygon([triangleCoords]);
+            try {
+                // To safely intersect poly vs poly
+                let intersection = turf.intersect(hexPoly, triangle);
+                if (intersection && turf.area(intersection) > 0) {
+                    let c = turf.centroid(intersection);
+                    panoPoints.push(c.geometry.coordinates);
+                }
+            } catch (e) { console.error("Intersection failed", e); }
+        }
+        // Rotate by -1
+        if (panoPoints.length > 1) {
+            panoPoints = [panoPoints[panoPoints.length - 1], ...panoPoints.slice(0, panoPoints.length - 1)];
+        }
+        return [center, ...panoPoints];
+    }
+
+    function getPanoActions(camera, params) {
+        const fov = params.fov || 360;
+        const overlap = params.overlap || 0.45;
+        const hFov = camera.hFovInDegrees;
+        const yawCount = Math.ceil(fov / ((1 - overlap) * hFov));
+        let actions = [{ type: "SINGLE_PHOTO", yawAngle: -180, gimbalPitchAngle: -90 }];
+        for (let i = 0; i < yawCount; i++) {
+            let yawAngle = roundAngle(-180 + (360 * i / yawCount));
+            let pitches = (i % 2 !== 0) ? [...params.gimbalPitches].reverse() : [...params.gimbalPitches];
+            for (let pitch of pitches) {
+                actions.push({ type: "SINGLE_PHOTO", yawAngle: yawAngle, gimbalPitchAngle: pitch });
+            }
+        }
+        return actions;
+    }
+
+    function buildPanoWaypoint(lng, lat, altitude, speed, actions) {
+        return { longitude: roundCoord(lng), latitude: roundCoord(lat), altitude, actions, speed, isFlyThrough: false, isFlightLineStart: false, isFlightLineEnd: false, imageTag: "pano" };
+    }
+
+    function generatePanoramaMission(hash, params, camera) {
+        const center = getHexCentroid(hash);
+        const actions = getPanoActions(camera, params);
+        const wp = buildPanoWaypoint(center[0], center[1], params.altitude, params.speed, actions);
+        return { type: "panorama", waypoints: [wp], pano_points: [center], flight_coords: [], photo_count: actions.length };
+    }
+
+    function generateMultiPanoramaMission(hash, params, camera) {
+        const panoPoints = getHexPanos(hash);
+        const actions = getPanoActions(camera, params);
+        const waypoints = panoPoints.map(pt => buildPanoWaypoint(pt[0], pt[1], params.altitude, params.speed, actions));
+        return { type: "multiPanorama", waypoints: waypoints, pano_points: panoPoints, flight_coords: waypoints.map(wp => [wp.longitude, wp.latitude]), photo_count: actions.length * panoPoints.length };
+    }
+
+    function generateMapPath(hash, params, camera) {
+        const hexCoords = getHexBoundary(hash);
+        const hexPoly = turf.polygon([hexCoords]);
+        const centroid = getHexCentroid(hash);
+
+        const longestIdx = getLongestLineIndex(hexCoords);
+        let baseBearing = bearingBetween(hexCoords[longestIdx], hexCoords[longestIdx + 1]) + 90;
+        let flightBearing = params.bearing.mode === "relative" ? baseBearing + params.bearing.value : params.bearing.value;
+        flightBearing = (flightBearing + 360) % 360;
+
+        const gimbalPitch = params.gimbalPitch !== undefined ? params.gimbalPitch : -90;
+        const gimbalAngleFromNadir = 90 - Math.abs(gimbalPitch);
+        const gimbalOffset = params.altitude * Math.tan(gimbalAngleFromNadir * Math.PI / 180);
+
+        const gsd = calcGsd(params.altitude, camera);
+        const lineSpacing = calcLineSpacing(params.slap, camera, gsd);
+        const photoInterval = calcPhotoInterval(camera, gsd, params.flap);
+
+        const isGrid = params.isGridMap || false;
+        const angles = isGrid ? [0, 90] : [0];
+        const allFlightCoords = [];
+
+        for (let angle of angles) {
+            let effectiveBearing = flightBearing + angle;
+            // Negative effectiveBearing to align with scan direction horizontally
+            let rotatedHexCoords = rotateCoords(hexCoords, -effectiveBearing, centroid);
+            let rotatedPoly = turf.polygon([rotatedHexCoords]);
+            let bbox = turf.bbox(rotatedPoly); // minX, minY, maxX, maxY
+            let [min_x, min_y, max_x, max_y] = bbox;
+            let totalHeight = max_y - min_y;
+
+            let spacingDeg = lineSpacing / 111320;
+            let numLines = Math.floor(totalHeight / spacingDeg);
+            let remainder = totalHeight - (numLines * spacingDeg);
+            let startOffset = spacingDeg < totalHeight ? remainder / 2 : totalHeight / 2;
+
+            let scanLines = [];
+            let lastEndpoint = null;
+            let y = min_y + startOffset;
+
+            while (y <= max_y) {
+                let scanLine = turf.lineString([[min_x - 0.001, y], [max_x + 0.001, y]]);
+                // Cut line by polygon
+                let segments = [];
                 try {
-                    if (!terrainEnabled) {
-                        if (!map.getSource('mapbox-dem')) {
-                            map.addSource('mapbox-dem', {
-                                type: 'raster-dem',
-                                url: 'mapbox://mapbox.mapbox-terrain-dem-v1',
-                                tileSize: 512,
-                                maxzoom: 14
-                            });
-                        }
-                        map.setTerrain({ source: 'mapbox-dem' });
-                        btn.textContent = '2D';
-                        terrainEnabled = true;
+                    let split = turf.lineSplit(scanLine, rotatedPoly);
+                    if (!split || split.features.length === 0) {
+                        let mid = turf.midpoint(scanLine.geometry.coordinates[0], scanLine.geometry.coordinates[1]);
+                        if (turf.booleanPointInPolygon(mid, rotatedPoly)) segments.push(scanLine.geometry.coordinates);
                     } else {
-                        map.setTerrain(null);
-                        btn.textContent = '3D';
-                        terrainEnabled = false;
-                    }
-                } catch (err) {
-                    console.error('Terrain toggle error', err);
-                }
-            };
-
-            inner.insertBefore(btn, inner.firstChild);
-        } catch (err) {
-            console.error('injectTerrainToggle error', err);
-        }
-    }
-
-    // Zone and Mission Handling
-    function overrideFetch() {
-        const originalFetch = window.fetch;
-        window.fetch = async function(...args) {
-            const response = await originalFetch.apply(this, args);
-            const url = args[0];
-            if (typeof url === 'string' && url.includes('/prod/api/zones/')) {
-                const m = url.match(/\/zones\/(\w{15})/);
-                const zone = m?.[1];
-                if (zone) {
-                    response.clone().json().then(data => {
-                        if (!data?.data?.isLocked) {
-                            lastZone = zone;
-                            loadMissions(zone);
-                        } else {
-                            removeMissionSection();
-                            removePreview();
+                        for (let feat of split.features) {
+                            let pts = feat.geometry.coordinates;
+                            let mid = turf.midpoint(pts[0], pts[pts.length - 1]);
+                            if (turf.booleanPointInPolygon(mid, rotatedPoly)) segments.push(pts);
                         }
-                    });
-                }
-            }
-            return response;
-        };
-    }
-
-    function removeMissionSection() {
-        const el = document.querySelector('.zone__flights--available');
-        if (el) el.remove();
-    }
-
-    function loadMissions(h3Hash) {
-        removeMissionSection();
-        fetch(`https://2139ukv0g6.execute-api.ca-central-1.amazonaws.com/prod/api/missions?status=active&status=hold&zone_hash=${h3Hash}`)
-            .then(r => r.json())
-            .then(res => {
-                if (res.success && res.data.length) {
-                    lastMissions = res.data;
-                    setTimeout(() => showMissionSection(res.data), 300);
-                }
-            });
-    }
-
-    function showMissionSection(missions) {
-        const parent = document.querySelector('.c-kiAJIg.c-kiAJIg-iTKOFX-dir-v.c-kiAJIg-fVlWzK-spacing-s.c-kiAJIg-hinyfY-fillParent-true');
-        if (!parent) return;
-        const before = Array.from(parent.children).find(c => c.className.includes('c-kiAJIg-ibwOCkq-css'));
-        if (!before) return;
-
-        removeMissionSection();
-        const container = document.createElement('div');
-        container.className = 'c-eiktij c-eiktij-hVCjZQ-background-darken c-eiktij-ivYAPe-pagination-none c-eiktij-iydAuT-inlaid-true zone__flights--available';
-
-        const titleWrap = document.createElement('div');
-        titleWrap.className = 'c-kiAJIg c-kiAJIg-knmidH-justify-spaced c-kiAJIg-eKWVTQ-spacing-m c-kiAJIg-iTjmwG-css';
-        titleWrap.innerHTML = `<p class="c-lbNOYO c-lbNOYO-jwYGDW-variant-primary_header"><span class="c-jgPCyX c-jgPCyX-eKvWLo-variant-subtle">Available Missions</span></p>`;
-        container.appendChild(titleWrap);
-
-        const scrollWrapper = document.createElement('div');
-        scrollWrapper.className = 'c-kiAJIg c-kiAJIg-iTKOFX-dir-v c-kiAJIg-iiQOSPq-css';
-        const fillDiv = document.createElement('div');
-        fillDiv.className = 'c-kiAJIg c-kiAJIg-iTKOFX-dir-v c-kiAJIg-hinyfY-fillParent-true';
-        const ltrDiv = document.createElement('div');
-        ltrDiv.className = 'c-KHfmY';
-        ltrDiv.setAttribute('dir', 'ltr');
-        ltrDiv.style.position = 'relative';
-        ltrDiv.style.setProperty('--radix-scroll-area-corner-width', '0px');
-        ltrDiv.style.setProperty('--radix-scroll-area-corner-height', '0px');
-
-        const styleTag = document.createElement('style');
-        styleTag.textContent = '[data-radix-scroll-area-viewport]{scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch;}[data-radix-scroll-area-viewport]::-webkit-scrollbar{display:none}';
-        ltrDiv.appendChild(styleTag);
-
-        const viewport = document.createElement('div');
-        viewport.className = 'c-ktOQXn';
-        viewport.setAttribute('data-radix-scroll-area-viewport', '');
-        viewport.style.overflow = 'scroll';
-        const tableWrap = document.createElement('div');
-        tableWrap.style.minWidth = '100%';
-        tableWrap.style.display = 'table';
-        const table = document.createElement('table');
-        table.className = 'c-hyjINs';
-
-        const thead = document.createElement('thead');
-        thead.className = 'c-bysKvn';
-        thead.innerHTML = `<tr class="c-cHCiJL c-PJLV"><th class="c-inedAR"><p></p></th><th class="c-inedAR"><p>Reward</p></th><th class="c-inedAR"><p>Flight Plan</p></th><th class="c-inedAR"><p>Created</p></th></tr>`;
-
-        const tbody = document.createElement('tbody');
-        tbody.className = 'c-cmpvrW';
-
-        missions.forEach((m, i) => {
-            const tr = document.createElement('tr');
-            tr.className = 'c-cHCiJL c-gvgkRI';
-            tr.dataset.index = i;
-            const tdName = document.createElement('td');
-            tdName.className = 'c-inedAR';
-            tdName.innerHTML = `<p class="c-lbNOYO c-lbNOYO-lmEyWq-variant-secondary_body c-lbNOYO-dKdvLu-size-s">${m.flight_plan.name}</p>`;
-            const tdReward = document.createElement('td');
-            tdReward.className = 'c-inedAR';
-            tdReward.innerHTML = `<div class="c-kiAJIg c-kiAJIg-iTKOFX-dir-v c-kiAJIg-ivYAPe-spacing-none"><p class="c-lbNOYO c-lbNOYO-kpetlT-variant-primary_body c-lbNOYO-fsvfVm-size-xs">$${Number(m.amount / 100).toFixed(2)} ${m.currency}</p><p class="c-lbNOYO c-lbNOYO-lmEyWq-variant-secondary_body">+ ${m.rp_amount} RP</p></div>`;
-            const tdAct = document.createElement('td');
-            tdAct.className = 'c-inedAR';
-            const btn = document.createElement('button');
-            btn.textContent = 'Preview';
-            btn.className = 'c-kSHLrh c-kSHLrh-dXpgym-variant-primary_outline c-kSHLrh-fyQYCy-size-s PJLV';
-            btn.addEventListener('click', () => previewPanorama(i));
-            tdAct.appendChild(btn);
-            const btn2 = document.createElement('button');
-            btn2.textContent = 'Export';
-            btn2.className = 'c-kSHLrh c-kSHLrh-dXpgym-variant-primary_outline c-kSHLrh-fyQYCy-size-s PJLV';
-            btn2.addEventListener('click', () => showExportMenu(m));
-            tdAct.appendChild(btn2);
-            const tdUpdated = document.createElement('td');
-            tdUpdated.className = 'c-inedAR';
-            tdUpdated.innerHTML = `<p class="c-lbNOYO c-lbNOYO-lmEyWq-variant-secondary_body c-lbNOYO-dKdvLu-size-s">${timeAgo(m.created_at)}</p>`;
-            tr.append(tdName, tdReward, tdAct, tdUpdated);
-            tbody.appendChild(tr);
-        });
-
-        table.append(thead, tbody);
-        tableWrap.appendChild(table);
-        viewport.appendChild(tableWrap);
-        ltrDiv.appendChild(viewport);
-        fillDiv.appendChild(ltrDiv);
-        scrollWrapper.appendChild(fillDiv);
-        container.appendChild(scrollWrapper);
-        parent.insertBefore(container, before);
-    }
-
-    // Utility Functions
-    function timeAgo(timestamp) {
-        const now = new Date();
-        const past = new Date(timestamp);
-        const diffMs = now - past;
-        const seconds = Math.floor(diffMs / 1000);
-        const minutes = Math.floor(seconds / 60);
-        const hours = Math.floor(minutes / 60);
-        const days = Math.floor(hours / 24);
-        const years = Math.floor(days / 365);
-
-        if (years > 0) return `${years} year${years > 1 ? 's' : ''} ago`;
-        if (days > 0) return `${days} day${days > 1 ? 's' : ''} ago`;
-        if (hours > 0) return `${hours} hour${hours > 1 ? 's' : ''} ago`;
-        if (minutes > 0) return `${minutes} minute${minutes > 1 ? 's' : ''} ago`;
-        return `just now`;
-    }
-
-    function toRadians(d) {
-        return d * Math.PI / 180;
-    }
-
-    function toDegrees(r) {
-        return r * 180 / Math.PI;
-    }
-
-    function destinationPoint(lat, lng, dist, bearing) {
-        const R = 6371000,
-            δ = dist / R,
-            θ = toRadians(bearing),
-            φ1 = toRadians(lat),
-            λ1 = toRadians(lng);
-        const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(θ));
-        const λ2 = λ1 + Math.atan2(Math.sin(θ) * Math.sin(δ) * Math.cos(φ1), Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2));
-        return [toDegrees(φ2), ((toDegrees(λ2) + 540) % 360) - 180];
-    }
-
-    function distanceBetween([lat1, lng1], [lat2, lng2]) {
-        const R = 6371000;
-        const dLat = toRadians(lat2 - lat1);
-        const dLng = toRadians(lng2 - lng1);
-        const a = Math.sin(dLat / 2) ** 2 +
-            Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) *
-            Math.sin(dLng / 2) ** 2;
-        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    }
-
-    function calculateBearing(p1, p2) {
-        if (!p1 || !p2 || !p1[0] || !p2[0]) {
-            throw new Error("Invalid points for bearing calculation");
-        }
-        const lat1 = toRadians(p1[0]);
-        const lng1 = toRadians(p1[1]);
-        const lat2 = toRadians(p2[0]);
-        const lng2 = toRadians(p2[1]);
-        const dLng = lng2 - lng1;
-        const y = Math.sin(dLng) * Math.cos(lat2);
-        const x = Math.cos(lat1) * Math.sin(lat2) -
-            Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
-        return (toDegrees(Math.atan2(y, x)) + 360) % 360;
-    }
-
-    function lineIntersects(p1, p2, p3, p4) {
-        const denom = (p4[1] - p3[1]) * (p2[0] - p1[0]) - (p4[0] - p3[0]) * (p2[1] - p1[1]);
-        if (Math.abs(denom) < 1e-10) return null;
-
-        const ua = ((p4[0] - p3[0]) * (p1[1] - p3[1]) - (p4[1] - p3[1]) * (p1[0] - p3[0])) / denom;
-        const ub = ((p2[0] - p1[0]) * (p1[1] - p3[1]) - (p2[1] - p1[1]) * (p1[0] - p3[0])) / denom;
-
-        if (ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1) {
-            const x = p1[0] + ua * (p2[0] - p1[0]);
-            const y = p1[1] + ua * (p2[1] - p1[1]);
-            return [x, y];
-        }
-        return null;
-    }
-
-    function densifyLine(coords, maxSpacingMeters = 50) {
-        const densified = [];
-        for (let i = 0; i < coords.length - 1; i++) {
-            const [startLat, startLng] = coords[i];
-            const [endLat, endLng] = coords[i + 1];
-            const distance = distanceBetween([startLat, startLng], [endLat, endLng]);
-            const numExtraPoints = Math.floor(distance / maxSpacingMeters);
-            densified.push([startLat, startLng]);
-
-            for (let j = 1; j <= numExtraPoints; j++) {
-                const fraction = j / (numExtraPoints + 1);
-                const interpLat = startLat + (endLat - startLat) * fraction;
-                const interpLng = startLng + (endLng - startLng) * fraction;
-                densified.push([interpLat, interpLng]);
-            }
-        }
-        densified.push(coords[coords.length - 1]);
-        return densified;
-    }
-
-    // Panorama and Map Rendering
-    function makeCirclePolygon([lat, lng], radius = 5, sides = 32) {
-        const coords = [];
-        for (let i = 0; i <= sides; i++) {
-            const angle = (i / sides) * 2 * Math.PI;
-            const dx = radius * Math.cos(angle);
-            const dy = radius * Math.sin(angle);
-            const dest = destinationPoint(lat, lng, Math.sqrt(dx * dx + dy * dy), toDegrees(Math.atan2(dx, dy)));
-            coords.push([dest[1], dest[0]]);
-        }
-        return {
-            type: 'Feature',
-            geometry: {
-                type: 'Polygon',
-                coordinates: [coords]
-            }
-        };
-    }
-
-    function get7PanoramaPoints(zoneHash) {
-        const center = h3ToGeo(zoneHash);
-        const boundary = h3ToGeoBoundary(zoneHash, true);
-        const pts = [center];
-        const ratio = 0.622;
-        for (let i = 0; i < 6; i++) {
-            const [lng2, lat2] = boundary[i];
-            const [lat1, lng1] = center;
-            const dLat = toRadians(lat2 - lat1);
-            const dLon = toRadians(lng2 - lng1);
-            const φ1 = toRadians(lat1);
-            const φ2 = toRadians(lat2);
-            const a = Math.sin(dLat / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(dLon / 2) ** 2;
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-            const dist = 6371000 * c;
-            const y = Math.sin(dLon) * Math.cos(φ2);
-            const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(dLon);
-            const bearing = (toDegrees(Math.atan2(y, x)) + 360) % 360;
-            pts.push(destinationPoint(lat1, lng1, dist * ratio, bearing));
-        }
-        return pts;
-    }
-
-    function getEdgeWaypoints(zoneHash) {
-        const boundary = h3ToGeoBoundary(zoneHash, false);
-        let longestEdge = { length: 0, startIdx: 0, endIdx: 0 };
-        for (let i = 0; i < boundary.length; i++) {
-            const p1 = boundary[i];
-            const p2 = boundary[(i + 1) % boundary.length];
-            const lat1 = toRadians(p1[0]);
-            const lng1 = toRadians(p1[1]);
-            const lat2 = toRadians(p2[0]);
-            const lng2 = toRadians(p2[1]);
-            const dLat = lat2 - lat1;
-            const dLng = lng2 - lng1;
-            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-            const distance = 6371000 * c;
-            if (distance > longestEdge.length) {
-                longestEdge = { length: distance, startIdx: i, endIdx: (i + 1) % boundary.length };
-            }
-        }
-
-        const startLongest = longestEdge.startIdx;
-        const endLongest = longestEdge.endIdx;
-        const startVertexIdx = (startLongest + boundary.length - 1) % boundary.length;
-        const endVertexIdx = (endLongest + 1) % boundary.length;
-        const startVertex = boundary[startVertexIdx];
-        const endVertex = boundary[endVertexIdx];
-        const startUp = boundary[(startVertexIdx + 1) % boundary.length];
-        const startDown = boundary[(startVertexIdx + boundary.length - 1) % boundary.length];
-        const endUp = boundary[(endVertexIdx + 1) % boundary.length];
-        const endDown = boundary[(endVertexIdx + boundary.length - 1) % boundary.length];
-        const ratio = 0.232;
-        const sUp = interpolatePoints(startVertex, startUp, ratio, 4);
-        const sDown = interpolatePoints(startVertex, startDown, ratio, 4);
-        const eUp = interpolatePoints(endVertex, endUp, ratio, 4);
-        const eDown = interpolatePoints(endVertex, endDown, ratio, 4);
-
-        const ordered = [
-            sDown[3], eUp[3], eUp[2], sDown[2], sDown[1], eUp[1], eUp[0], sDown[0],
-            startVertex, endVertex, eDown[0], sUp[0], sUp[1], eDown[1], eDown[2], sUp[2], sUp[3], eDown[3]
-        ];
-
-        const coords = densifyLine(ordered, 25);
-        return { coords };
-    }
-
-    function getEdgeWaypointsGridMap(zoneHash) {
-        const boundary = h3ToGeoBoundary(zoneHash, false);
-        let longestEdge = { length: 0, startIdx: 0 };
-        for (let i = 0; i < boundary.length; i++) {
-            const [aLat, aLng] = boundary[i];
-            const [bLat, bLng] = boundary[(i + 1) % boundary.length];
-            const d = distanceBetween([aLat, aLng], [bLat, bLng]);
-            if (d > longestEdge.length) {
-                longestEdge = { length: d, startIdx: i };
-            }
-        }
-
-        const startIdx = (longestEdge.startIdx + 5) % 6;
-        const endIdx = (longestEdge.startIdx + 2) % 6;
-        const start = boundary[startIdx];
-        const end = boundary[endIdx];
-        const startUp = boundary[(startIdx + 1) % 6];
-        const startDown = boundary[(startIdx + 5) % 6];
-        const endUp = boundary[(endIdx + 1) % 6];
-        const endDown = boundary[(endIdx + 5) % 6];
-        const ratio = 0.232;
-        const sUp = interpolatePoints(start, startUp, ratio, 4);
-        const sDown = interpolatePoints(start, startDown, ratio, 4);
-        const eUp = interpolatePoints(end, endUp, ratio, 4);
-        const eDown = interpolatePoints(end, endDown, ratio, 4);
-
-        const firstPart = [
-            sDown[3], eUp[3], eUp[2], sDown[2], sDown[1], eUp[1], eUp[0], sDown[0],
-            start, end, eDown[0], sUp[0], sUp[1], eDown[1], eDown[2], sUp[2], sUp[3], eDown[3]
-        ];
-
-        const firstPartBearing = calculateBearing(start, end);
-        const perpendicularBearing = (firstPartBearing + 90) % 360;
-        const lineStart = sDown[3];
-        const lineEnd = eUp[3];
-        const pointOnSecondLine = sDown[2];
-        const bearingLine = calculateBearing(lineStart, lineEnd);
-        const bearingToPoint = calculateBearing(lineStart, pointOnSecondLine);
-        let angleDiffWithLine = Math.abs(bearingToPoint - bearingLine);
-        if (angleDiffWithLine > 180) angleDiffWithLine = 360 - angleDiffWithLine;
-        const directDistToPoint = distanceBetween(lineStart, pointOnSecondLine);
-        const d = directDistToPoint * Math.sin(toRadians(angleDiffWithLine));
-        const yellowVertexIdx = (longestEdge.startIdx - 1 + 6) % 6;
-        const blueVertexIdx = (longestEdge.startIdx + 2) % 6;
-        const yellowVertex = boundary[yellowVertexIdx];
-        const blueVertex = boundary[blueVertexIdx];
-        const directBearing = calculateBearing(yellowVertex, blueVertex);
-        const directDistance = distanceBetween(yellowVertex, blueVertex);
-        let angleDiff = Math.abs(directBearing - perpendicularBearing);
-        if (angleDiff > 180) angleDiff = 360 - angleDiff;
-        if (angleDiff > 90) angleDiff = 180 - angleDiff;
-        const sinAngle = Math.sin(toRadians(angleDiff));
-        const adjustedStepDistance = sinAngle > 1e-6 ? d / sinAngle : d;
-        const scanGapCount = Math.floor(directDistance / adjustedStepDistance);
-
-        const waypoints = {};
-        let waypointCounter = 1;
-
-        for (let i = 0; i <= scanGapCount; i++) {
-            let currentPoint = (i === 0) ? yellowVertex : destinationPoint(
-                yellowVertex[0], yellowVertex[1],
-                i * adjustedStepDistance, directBearing
-            );
-
-            const lStart = destinationPoint(currentPoint[0], currentPoint[1], 2000, perpendicularBearing);
-            const lEnd = destinationPoint(currentPoint[0], currentPoint[1], 2000, (perpendicularBearing + 180) % 360);
-            const intersections = [];
-            for (let j = 0; j < boundary.length; j++) {
-                const inter = lineIntersects(lStart, lEnd, boundary[j], boundary[(j + 1) % boundary.length]);
-                if (inter) intersections.push(inter);
-            }
-
-            intersections.sort((a, b) => distanceBetween(currentPoint, a) - distanceBetween(currentPoint, b));
-            if (intersections.length >= 2) {
-                if (waypointCounter <= 22) waypoints[`WAYPOINT ${waypointCounter++}`] = intersections[0];
-                if (waypointCounter <= 22) waypoints[`WAYPOINT ${waypointCounter++}`] = intersections[1];
-            }
-        }
-
-        const waypointOrder = [
-            "WAYPOINT 22", "WAYPOINT 21", "WAYPOINT 19", "WAYPOINT 20",
-            "WAYPOINT 18", "WAYPOINT 17", "WAYPOINT 16", "WAYPOINT 15",
-            "WAYPOINT 13", "WAYPOINT 14", "WAYPOINT 12", "WAYPOINT 11",
-            "WAYPOINT 9", "WAYPOINT 10", "WAYPOINT 8", "WAYPOINT 7",
-            "WAYPOINT 5", "WAYPOINT 6", "WAYPOINT 4", "WAYPOINT 3",
-            "WAYPOINT 1", "WAYPOINT 2"
-        ];
-
-        const secondPart = waypointOrder.map(name => waypoints[name]).filter(Boolean);
-        const firstPartOffset = offsetFirstPart(firstPart, 50);
-        const secondPartOffset = offsetSecondPart(secondPart, 50);
-        const coords = densifyLine([...firstPartOffset, ...secondPartOffset], 25);
-        return { coords };
-    }
-
-    function interpolatePoints(p1, p2, ratio, count) {
-        const points = [];
-        for (let i = 1; i <= count; i++) {
-            const lat = p1[0] + (p2[0] - p1[0]) * ratio * i;
-            const lng = p1[1] + (p2[1] - p1[1]) * ratio * i;
-            points.push([lat, lng]);
-        }
-        return points;
-    }
-
-    function offsetFirstPart(firstPart, offsetDistance) {
-        return firstPart.map((pt, i) => {
-            let bearing = i % 2 === 0
-                ? calculateBearing(pt, firstPart[i + 1])
-                : calculateBearing(firstPart[i - 1], pt);
-            const offsetBearing = (bearing + 180) % 360;
-            return destinationPoint(pt[0], pt[1], offsetDistance, offsetBearing);
-        });
-    }
-
-    function offsetSecondPart(secondPart, offsetDistance) {
-        return secondPart.map((pt, i) => {
-            let bearing = i % 2 === 0
-                ? calculateBearing(pt, secondPart[i + 1])
-                : calculateBearing(secondPart[i - 1], pt);
-            const offsetBearing = (bearing + 180) % 360;
-            return destinationPoint(pt[0], pt[1], offsetDistance, offsetBearing);
-        });
-    }
-
-    function previewPanorama(index) {
-        if (!window.__spexMap) return console.error('Map not ready');
-        const map = window.__spexMap;
-
-        // Clear previous previews
-        ['pan-extrusions', 'map-lines'].forEach(layer => {
-            if (map.getLayer(layer)) map.removeLayer(layer);
-            if (map.getSource(layer)) map.removeSource(layer);
-        });
-
-        const mission = lastMissions[index];
-        const flightPlanId = mission.flight_plan_id;
-
-        if (flightPlanId === 1 || flightPlanId === 4) {
-            const { coords } = flightPlanId === 1 ? getEdgeWaypoints(lastZone) : getEdgeWaypointsGridMap(lastZone);
-            const lineGeoJSON = {
-                type: 'FeatureCollection',
-                features: [{
-                    type: 'Feature',
-                    geometry: {
-                        type: 'LineString',
-                        coordinates: coords.map(([lat, lng]) => [lng, lat])
                     }
-                }]
-            };
+                } catch (e) { }
 
-            map.addSource('map-lines', { type: 'geojson', data: lineGeoJSON });
-            map.addLayer({
-                id: 'map-lines',
-                type: 'line',
-                source: 'map-lines',
-                layout: {
-                    'line-join': 'round',
-                    'line-cap': 'round'
-                },
-                paint: {
-                    'line-color': '#ff0000',
-                    'line-width': 2
+                for (let segCoords of segments) {
+                    if (segCoords.length >= 2) {
+                        // Reverse initially (like App DESC sort)
+                        segCoords.reverse();
+                        if (gimbalPitch === -90) {
+                            if (scanLines.length % 2 !== 0) segCoords.reverse();
+                        } else {
+                            if (lastEndpoint) {
+                                let dFwd = Math.pow(segCoords[0][0] - lastEndpoint[0], 2) + Math.pow(segCoords[0][1] - lastEndpoint[1], 2);
+                                let dRev = Math.pow(segCoords[segCoords.length - 1][0] - lastEndpoint[0], 2) + Math.pow(segCoords[segCoords.length - 1][1] - lastEndpoint[1], 2);
+                                if (dRev < dFwd) segCoords.reverse();
+                            }
+                        }
+                        lastEndpoint = segCoords[segCoords.length - 1];
+                        scanLines.push(segCoords);
+                    }
                 }
-            });
-
-            const first = coords[0];
-            map.flyTo({ center: [first[1], first[0]], zoom: 15 });
-        } else {
-            let extrusionFeatures = [];
-            if (flightPlanId === 3) {
-                const center = h3ToGeo(lastZone);
-                extrusionFeatures = [makeCirclePolygon(center)];
-            } else {
-                const points = get7PanoramaPoints(lastZone);
-                extrusionFeatures = points.map(p => makeCirclePolygon(p));
+                y += spacingDeg;
             }
 
-            const extrusionGeoJSON = {
-                type: 'FeatureCollection',
-                features: extrusionFeatures
-            };
-
-            map.addSource('pan-extrusions', { type: 'geojson', data: extrusionGeoJSON });
-            map.addLayer({
-                id: 'pan-extrusions',
-                type: 'fill-extrusion',
-                source: 'pan-extrusions',
-                paint: {
-                    'fill-extrusion-color': '#ff5050',
-                    'fill-extrusion-height': 80,
-                    'fill-extrusion-base': 79.9,
-                    'fill-extrusion-opacity': 0.95
+            // Apply gimbal offset
+            if (gimbalOffset > 0) {
+                for (let i = 0; i < scanLines.length; i++) {
+                    let lineCoords = scanLines[i];
+                    if (lineCoords.length >= 2) {
+                        let lineBrng = turf.rhumbBearing(lineCoords[0], lineCoords[lineCoords.length - 1]);
+                        let offsetBrng = (-lineBrng + 360) % 360;
+                        let offsetLine = [];
+                        for (let pt of lineCoords) {
+                            // turf rhumbDestination returns Feature
+                            let dest = turf.rhumbDestination(pt, gimbalOffset, offsetBrng, { units: 'meters' });
+                            offsetLine.push(dest.geometry.coordinates);
+                        }
+                        scanLines[i] = offsetLine;
+                    }
                 }
-            });
+            }
 
-            const center = extrusionFeatures[0].geometry.coordinates[0][0];
-            map.flyTo({ center, zoom: 15 });
+            // Rotate back
+            for (let lineCoords of scanLines) {
+                let rotatedBack = rotateCoords(lineCoords, effectiveBearing, centroid);
+                allFlightCoords.push(...rotatedBack);
+            }
         }
+
+        let flyingHeight = params.altitude - (params.takeOffOffset || 0);
+        return { coords: allFlightCoords, photo_interval: photoInterval, flying_height: flyingHeight, gsd: gsd, line_spacing: lineSpacing, image_tag: isGrid ? "gridMap" : "map" };
     }
 
-    function removePreview() {
-        const map = window.__spexMap;
-        if (!map) return;
-        ['pan-points', 'pan-line', 'pan-extrusions', 'map-lines'].forEach(layer => {
-            if (map.getLayer(layer)) map.removeLayer(layer);
-            if (map.getSource(layer)) map.removeSource(layer);
+    function buildMapWaypoints(flightData, params) {
+        const coords = flightData.coords;
+        const photoInterval = flightData.photo_interval;
+        const speed = params.speed || 10;
+        const gimbalPitch = params.gimbalPitch !== undefined ? params.gimbalPitch : -90;
+        let waypoints = [];
+        let i = 0;
+        while (i < coords.length - 1) {
+            let start = coords[i], end = coords[i + 1];
+            let yaw = roundAngle(bearingBetween(start, end));
+            let segLength = distanceMeters(start, end);
+            let action = { type: "SINGLE_PHOTO", yawAngle: yaw, gimbalPitchAngle: gimbalPitch };
+
+            waypoints.push({ longitude: roundCoord(start[0]), latitude: roundCoord(start[1]), altitude: flightData.flying_height, actions: [action], speed, isFlyThrough: false, isFlightLineStart: true, isFlightLineEnd: false, imageTag: flightData.image_tag });
+
+            if (segLength > 0 && photoInterval > 0) {
+                let dist = photoInterval;
+                while (dist < segLength) {
+                    let pt = pointAlongLine(start, end, dist / segLength);
+                    waypoints.push({ longitude: roundCoord(pt[0]), latitude: roundCoord(pt[1]), altitude: flightData.flying_height, actions: [action], speed, isFlyThrough: true, isFlightLineStart: false, isFlightLineEnd: false, imageTag: flightData.image_tag });
+                    dist += photoInterval;
+                }
+            }
+            waypoints.push({ longitude: roundCoord(end[0]), latitude: roundCoord(end[1]), altitude: flightData.flying_height, actions: [action], speed, isFlyThrough: false, isFlightLineStart: false, isFlightLineEnd: true, imageTag: flightData.image_tag });
+            i += 2;
+        }
+        return waypoints;
+    }
+
+    function generateMapMission(hash, params, camera, isGrid = false) {
+        let newParams = { ...params, isGridMap: isGrid };
+        let flightData = generateMapPath(hash, newParams, camera);
+        let waypoints = buildMapWaypoints(flightData, newParams);
+        return { type: isGrid ? "gridMap" : "map", waypoints, pano_points: [], flight_coords: flightData.coords, photo_count: waypoints.length, gsd: flightData.gsd, line_spacing: flightData.line_spacing, photo_interval: flightData.photo_interval };
+    }
+
+    function generateHybridMission(hash, mapParams, panoParams, camera) {
+        let mapMission = generateMapMission(hash, mapParams, camera);
+        let panoPoints = getHexPanos(hash);
+        let actions = getPanoActions(camera, panoParams);
+        let panoWaypoints = panoPoints.map(pt => buildPanoWaypoint(pt[0], pt[1], panoParams.altitude, panoParams.speed, actions));
+        return { type: "hybrid", waypoints: [...mapMission.waypoints, ...panoWaypoints], pano_points: panoPoints, flight_coords: mapMission.flight_coords, photo_count: mapMission.photo_count + (actions.length * panoPoints.length), gsd: mapMission.gsd, line_spacing: mapMission.line_spacing, photo_interval: mapMission.photo_interval };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // KML GENERATOR
+    // ─────────────────────────────────────────────────────────────────────────────
+    function escapeXml(unsafe) {
+        return unsafe.toString().replace(/[<>&'"]/g, function (c) {
+            switch (c) { case '<': return '&lt;'; case '>': return '&gt;'; case '&': return '&amp;'; case '\'': return '&apos;'; case '"': return '&quot;'; }
         });
     }
 
-    // Export Functions
-    function showExportMenu(mission) {
-        const existing = document.getElementById('export-flight-path');
-        if (existing) existing.remove();
+    function buildKML(mission, hash, droneModel) {
+        const hexCoords = getHexBoundary(hash);
+        const centroid = getHexCentroid(hash);
 
-        const overlay = document.createElement('div');
-        overlay.id = 'export-flight-path';
-        overlay.className = 'c-kGOqqW';
-        overlay.style = `
-              background: rgba(0, 0, 0, 0.85);
-              position: fixed;
-              inset: 0;
-              display: grid;
-              place-items: center;
-              z-index: 9999;
-          `;
+        let lines = [];
+        lines.push(`<?xml version="1.0" encoding="UTF-8"?>`);
+        lines.push(`<kml xmlns="http://www.opengis.net/kml/2.2">`);
+        lines.push(`  <Document>`);
+        // mission.type is string like "map", "multiPanorama". Let's capitalize
+        let missionName = mission.type.charAt(0).toUpperCase() + mission.type.slice(1);
+        if (mission.type === "multiPanorama") missionName = "Multi-Panorama";
+        if (mission.type === "gridMap") missionName = "Grid Map";
 
-        const box = document.createElement('div');
-        box.style = `
-              background: #111;
-              padding: 20px;
-              border-radius: 8px;
-              box-shadow: 0 0 10px rgba(0,0,0,0.5);
-              width: 240px;
-              position: relative;
-          `;
+        lines.push(`    <name>Spexi ${missionName} Mission</name>`);
 
-        const close = document.createElement('button');
-        close.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M18 6L6 18" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 6L18 18" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-        close.style = `
-              position: absolute;
-              top: 8px;
-              right: 8px;
-              background: transparent;
-              border: none;
-              color: white;
-              cursor: pointer;
-          `;
-        close.onclick = () => overlay.remove();
+        // Styles
+        // hexStyle: solid green border (ff alpha, 00=B, ff=G, 00=R), no fill
+        lines.push(`    <Style id="hexStyle">
+      <LineStyle><color>ff00ff00</color><width>3</width></LineStyle>
+      <PolyStyle><fill>0</fill></PolyStyle>
+    </Style>`);
+        // pathStyle & transitStyle: solid pink line
+        lines.push(`    <Style id="pathStyle">
+      <LineStyle><color>ffff00ff</color><width>3</width></LineStyle>
+    </Style>`);
+        lines.push(`    <Style id="transitStyle">
+      <LineStyle><color>ffff00ff</color><width>3</width></LineStyle>
+    </Style>`);
+        lines.push(`    <Style id="panoStyle">
+      <IconStyle><color>ff00bbff</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/camera.png</href></Icon></IconStyle>
+    </Style>`);
+        lines.push(`    <Style id="panoPathStyle">
+      <LineStyle><color>ffff00ff</color><width>2</width></LineStyle>
+    </Style>`);
 
-        const title = document.createElement('h3');
-        title.textContent = 'Export Flight Path';
-        title.style = 'margin-top: 0; color: white;';
+        // Helper to interpolate points for terrain following
+        function interpolateLineStr(startPt, endPt, height) {
+            let dist = distanceMeters(startPt, endPt);
+            let segmentLength = 10; // 10 meters interpolation for smooth terrain curve
+            let outCoords = [];
 
-        const label = document.createElement('label');
-        label.textContent = 'Format';
-        label.style = 'color: white; display: block; margin: 8px 0 4px';
+            if (dist <= segmentLength) {
+                outCoords.push(`${roundCoord(startPt[0])},${roundCoord(startPt[1])},${height}`);
+                outCoords.push(`${roundCoord(endPt[0])},${roundCoord(endPt[1])},${height}`);
+                return outCoords.join(' ');
+            }
 
-        const select = document.createElement('select');
-        select.className = 'c-bFBfUq-biYssy-variant-input';
-        select.style = `
-              background: var(--colors-input_background);
-              border: 1px solid var(--colors-input_border);
-              border-radius: var(--radii-input);
-              color: var(--colors-input_foreground);
-              font-family: var(--fonts-body);
-              font-size: var(--fontSizes-input);
-              justify-content: space-between;
-              padding: var(--space-3) var(--space-5);
-              width: 100%;
-          `;
-        const opt0 = document.createElement('option');
-        opt0.disabled = true;
-        opt0.selected = true;
-        opt0.textContent = 'Select format';
-        const opt1 = document.createElement('option');
-        opt1.value = 'geojson';
-        opt1.textContent = '.geojson';
-        const opt2 = document.createElement('option');
-        opt2.value = 'kml';
-        opt2.textContent = '.kml (Google Earth)';
-        select.append(opt0, opt1, opt2);
+            let segments = Math.ceil(dist / segmentLength);
+            for (let j = 0; j <= segments; j++) {
+                let frac = j / segments;
+                let ipt = pointAlongLine(startPt, endPt, frac);
+                outCoords.push(`${roundCoord(ipt[0])},${roundCoord(ipt[1])},${height}`);
+            }
+            return outCoords.join(' ');
+        }
 
-        const exportBtn = document.createElement('button');
-        exportBtn.textContent = 'Export';
-        exportBtn.className = 'c-kSHLrh c-kSHLrh-dXpgym-variant-primary_outline c-kSHLrh-fyQYCy-size-s PJLV';
-        exportBtn.style.marginTop = '12px';
-        exportBtn.onclick = () => {
-            const format = select.value;
-            if (!format || format === 'Select format') return alert('Please select a format');
+        // Hex Feature - Floating at flight altitude
+        let hexAlt = mission.type.toLowerCase().includes("pano") ? PANO_PARAMS.altitude : MAP_PARAMS.altitude;
 
-            const points = mission.flight_plan_id === 3
-                ? [h3ToGeo(lastZone)]
-                : mission.flight_plan_id === 1
-                    ? getEdgeWaypoints(lastZone).coords
-                    : mission.flight_plan_id === 4
-                        ? getEdgeWaypointsGridMap(lastZone).coords
-                        : densifyLine(get7PanoramaPoints(lastZone), 25);
+        // Output boundary with interpolation
+        let hexCoordsInterp = [];
+        for (let i = 0; i < hexCoords.length - 1; i++) {
+            hexCoordsInterp.push(interpolateLineStr(hexCoords[i], hexCoords[i + 1], hexAlt).replace(/ [^ ]+$/, '')); // Avoid duplicate points
+        }
+        // close polygon smoothly
+        hexCoordsInterp.push(`${roundCoord(hexCoords[hexCoords.length - 1][0])},${roundCoord(hexCoords[hexCoords.length - 1][1])},${hexAlt}`);
+        let coordsStr = hexCoordsInterp.join(' ');
 
-            if (format === 'kml') {
-                exportFlightPathKML(mission, points);
-            } else if (format === 'geojson') {
-                exportFlightPathGeoJSON(mission, points);
+        lines.push(`    <Folder><name>Hex Boundary</name>
+      <Placemark><name>Spexigon ${hash}</name><styleUrl>#hexStyle</styleUrl>
+        <Polygon><altitudeMode>relativeToGround</altitudeMode>
+          <tessellate>1</tessellate>
+          <outerBoundaryIs><LinearRing><coordinates>${coordsStr}</coordinates></LinearRing></outerBoundaryIs>
+        </Polygon>
+      </Placemark></Folder>`);
+
+        // Path Feature
+        if (mission.flight_coords && mission.flight_coords.length >= 2) {
+            let mapAlt = MAP_PARAMS.altitude;
+            lines.push(`    <Folder><name>Flight Path</name>`);
+            // Draw lines
+            for (let i = 0; i < mission.flight_coords.length - 1; i += 2) {
+                if (i + 1 < mission.flight_coords.length) {
+                    let start = mission.flight_coords[i], end = mission.flight_coords[i + 1];
+                    let lineStr = interpolateLineStr(start, end, mapAlt);
+                    lines.push(`      <Placemark><name>Flight Line ${i / 2 + 1}</name><styleUrl>#pathStyle</styleUrl>
+        <LineString><altitudeMode>relativeToGround</altitudeMode><tessellate>1</tessellate><coordinates>${lineStr}</coordinates></LineString></Placemark>`);
+                }
+            }
+            // Draw transits
+            for (let i = 1; i < mission.flight_coords.length - 1; i += 2) {
+                if (i + 1 < mission.flight_coords.length) {
+                    let start = mission.flight_coords[i], end = mission.flight_coords[i + 1];
+                    let lineStr = interpolateLineStr(start, end, mapAlt);
+                    lines.push(`      <Placemark><name>Transit ${Math.floor(i / 2) + 1}</name><styleUrl>#transitStyle</styleUrl>
+        <LineString><altitudeMode>relativeToGround</altitudeMode><tessellate>1</tessellate><coordinates>${lineStr}</coordinates></LineString></Placemark>`);
+                }
+            }
+            lines.push(`    </Folder>`);
+        }
+
+        if (mission.pano_points && mission.pano_points.length > 0) {
+            lines.push(`    <Folder><name>Panorama Locations</name>`);
+            let panoAlt = PANO_PARAMS.altitude;
+            mission.pano_points.forEach((pt, idx) => {
+                let name = (idx === 0 && mission.pano_points.length > 1) ? "Center Pano" : `Pano ${idx + 1}`;
+                lines.push(`      <Placemark><name>${name}</name><styleUrl>#panoStyle</styleUrl>
+        <Point><altitudeMode>relativeToGround</altitudeMode><coordinates>${pt[0]},${pt[1]},${panoAlt}</coordinates></Point></Placemark>`);
+            });
+            lines.push(`    </Folder>`);
+        }
+
+        lines.push(`  </Document>`);
+        lines.push(`</kml>`);
+        // Output with actual newlines to fix Google Earth Parse error
+        return lines.join('\n');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // UI Injection
+    // ─────────────────────────────────────────────────────────────────────────────
+    function injectUI() {
+        const hashMatch = window.location.pathname.match(/\/zone\/([a-fA-F0-9]+)/);
+        let h3Hash = hashMatch ? hashMatch[1] : null;
+
+        // Try to find the button
+        let buttons = Array.from(document.querySelectorAll("button"));
+        let viewMapBtn = buttons.find(b => b.innerText && b.innerText.includes("View in Google Maps"));
+
+        if (!viewMapBtn) return; // not found
+
+        let container = viewMapBtn.parentElement;
+        if (!container || document.getElementById('spexi-flight-btn-group')) return;
+
+        h3Hash = h3Hash || document.querySelector("h1")?.innerText.split(" ")[0] || "8928d1a1a0bffff";
+
+        // Create a wrapper
+        let wrapper = document.createElement("div");
+        wrapper.id = "spexi-flight-btn-group";
+        wrapper.style.display = "inline-flex";
+        wrapper.style.alignItems = "center";
+        wrapper.style.position = "relative";
+
+        let dlBtn = document.createElement("button");
+        dlBtn.innerText = "Download Flight Path ▼";
+        dlBtn.className = viewMapBtn.className;
+        dlBtn.style.marginLeft = "8px";
+        dlBtn.style.cursor = "pointer";
+
+        let dropdown = document.createElement("div");
+        dropdown.style.display = "none";
+        dropdown.style.position = "absolute";
+        dropdown.style.bottom = "100%";
+        dropdown.style.right = "0";
+        dropdown.style.backgroundColor = "#2f2f3e";
+        dropdown.style.border = "1px solid #5a5a6b";
+        dropdown.style.borderRadius = "6px";
+        dropdown.style.padding = "4px 0";
+        dropdown.style.minWidth = "180px";
+        dropdown.style.zIndex = "999";
+        dropdown.style.marginBottom = "4px";
+        dropdown.style.boxShadow = "0 4px 12px rgba(0,0,0,0.4)";
+
+        const options = [
+            { id: 1, name: "Map" },
+            { id: 2, name: "Multi-Panorama" },
+            { id: 3, name: "Panorama" },
+            { id: 4, name: "Grid Map" },
+            { id: 5, name: "Hybrid" }
+        ];
+
+        options.forEach(opt => {
+            let item = document.createElement("div");
+            item.innerText = opt.name;
+            item.style.padding = "8px 16px";
+            item.style.color = "#fff";
+            item.style.cursor = "pointer";
+            item.style.fontFamily = "inherit";
+            item.style.transition = "background-color 0.2s";
+
+            item.onmouseover = () => item.style.backgroundColor = "#46465c";
+            item.onmouseout = () => item.style.backgroundColor = "transparent";
+
+            item.onclick = (e) => {
+                e.stopPropagation();
+                dropdown.style.display = "none";
+                triggerDownload(opt.id, h3Hash);
+            };
+            dropdown.appendChild(item);
+        });
+
+        let divider = document.createElement("div");
+        divider.style.height = "1px";
+        divider.style.backgroundColor = "#5a5a6b";
+        divider.style.margin = "4px 0";
+        dropdown.appendChild(divider);
+
+        let infoSection = document.createElement("div");
+        infoSection.id = "spexi-drone-info-text";
+        infoSection.style.padding = "4px 16px";
+        infoSection.style.fontSize = "12px";
+        infoSection.style.color = "#aaa";
+        infoSection.innerText = `Drone: ${DRONE_MODEL}`;
+        dropdown.appendChild(infoSection);
+
+        let settingsItem = document.createElement("div");
+        settingsItem.innerText = "⚙️ Settings";
+        settingsItem.style.padding = "8px 16px";
+        settingsItem.style.color = "#fff";
+        settingsItem.style.cursor = "pointer";
+        settingsItem.style.fontFamily = "inherit";
+        settingsItem.style.fontSize = "13px";
+        settingsItem.style.transition = "background-color 0.2s";
+
+        settingsItem.onmouseover = () => settingsItem.style.backgroundColor = "#46465c";
+        settingsItem.onmouseout = () => settingsItem.style.backgroundColor = "transparent";
+
+        settingsItem.onclick = (e) => {
+            e.stopPropagation();
+            dropdown.style.display = "none";
+            openSettingsModal();
+        };
+        dropdown.appendChild(settingsItem);
+
+        wrapper.appendChild(dlBtn);
+        wrapper.appendChild(dropdown);
+        container.appendChild(wrapper);
+
+        // Toggle dropdown
+        dlBtn.onclick = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (dropdown.style.display === "none") {
+                dropdown.style.display = "block";
             } else {
-                alert(`Unsupported format selected: ${format}`);
+                dropdown.style.display = "none";
             }
         };
 
-        box.append(close, title, label, select, exportBtn);
-        overlay.appendChild(box);
+        // Close dropdown when clicking outside
+        document.addEventListener("click", (e) => {
+            if (!wrapper.contains(e.target)) dropdown.style.display = "none";
+        });
+    }
+
+    function openSettingsModal() {
+        if (document.getElementById("spexi-flight-settings-modal")) return;
+
+        let overlay = document.createElement("div");
+        overlay.id = "spexi-flight-settings-modal";
+        overlay.style.position = "fixed";
+        overlay.style.top = "0";
+        overlay.style.left = "0";
+        overlay.style.width = "100vw";
+        overlay.style.height = "100vh";
+        overlay.style.backgroundColor = "rgba(0, 0, 0, 0.7)";
+        overlay.style.zIndex = "999999";
+        overlay.style.display = "flex";
+        overlay.style.justifyContent = "center";
+        overlay.style.alignItems = "center";
+
+        let modal = document.createElement("div");
+        modal.style.backgroundColor = "#24252e";
+        modal.style.borderRadius = "12px";
+        modal.style.padding = "24px";
+        modal.style.width = "380px";
+        modal.style.maxWidth = "90%";
+        modal.style.boxShadow = "0 8px 32px rgba(0,0,0,0.5)";
+        modal.style.color = "#fff";
+        modal.style.fontFamily = "inherit";
+        modal.style.display = "flex";
+        modal.style.flexDirection = "column";
+        modal.style.gap = "16px";
+
+        let title = document.createElement("h2");
+        title.innerText = "Flight Planner Settings";
+        title.style.margin = "0 0 8px 0";
+        title.style.fontSize = "18px";
+        title.style.borderBottom = "1px solid #3f3f4e";
+        title.style.paddingBottom = "12px";
+        modal.appendChild(title);
+
+        let form = document.createElement("div");
+        form.style.display = "flex";
+        form.style.flexDirection = "column";
+        form.style.gap = "12px";
+
+        function createField(label, el) {
+            let row = document.createElement("div");
+            row.style.display = "flex";
+            row.style.justifyContent = "space-between";
+            row.style.alignItems = "center";
+
+            let lbl = document.createElement("label");
+            lbl.innerText = label;
+            lbl.style.fontSize = "14px";
+            lbl.style.color = "#ccc";
+
+            row.appendChild(lbl);
+            row.appendChild(el);
+            return row;
+        }
+
+        let droneSel = document.createElement("select");
+        droneSel.style.padding = "6px";
+        droneSel.style.borderRadius = "4px";
+        droneSel.style.backgroundColor = "#1a1a24";
+        droneSel.style.color = "#fff";
+        droneSel.style.border = "1px solid #3f3f4e";
+        ["DJI Mini 2", "DJI Mini 3", "DJI Mini 3 Pro", "DJI Mini 4 Pro"].forEach(d => {
+            let opt = document.createElement("option");
+            opt.value = d;
+            opt.innerText = d;
+            if (d === DRONE_MODEL) opt.selected = true;
+            droneSel.appendChild(opt);
+        });
+        form.appendChild(createField("Drone Model", droneSel));
+
+        let tpTitle = document.createElement("h3");
+        tpTitle.innerText = "Trusted Pilot Parameters";
+        tpTitle.style.margin = "8px 0 0 0";
+        tpTitle.style.fontSize = "14px";
+        tpTitle.style.color = "#88d8b0";
+        form.appendChild(tpTitle);
+
+        function createSlider(id, min, max, step, val) {
+            let wrap = document.createElement("div");
+            wrap.style.display = "flex";
+            wrap.style.alignItems = "center";
+            wrap.style.gap = "8px";
+
+            let input = document.createElement("input");
+            input.type = "range";
+            input.min = min;
+            input.max = max;
+            input.step = step;
+            input.value = val;
+            input.id = id;
+            input.style.width = "100px";
+
+            let disp = document.createElement("span");
+            disp.innerText = val;
+            disp.style.minWidth = "30px";
+            disp.style.textAlign = "right";
+            disp.style.fontSize = "13px";
+
+            input.oninput = () => disp.innerText = input.value;
+
+            wrap.appendChild(input);
+            wrap.appendChild(disp);
+            return { wrap, input };
+        }
+
+        let altUI = createSlider("altSlider", 80, 122, 2, MAP_PARAMS.altitude);
+        form.appendChild(createField("Altitude (m)", altUI.wrap));
+
+        let pitchUI = createSlider("pitchSlider", -90, -45, 2.5, MAP_PARAMS.gimbalPitch);
+        form.appendChild(createField("Gimbal Pitch (°) (Map)", pitchUI.wrap));
+
+        let pitchGridUI = createSlider("pitchGridSlider", -90, -45, 2.5, MAP_PARAMS.gimbalPitchGrid);
+        form.appendChild(createField("Gimbal Pitch (°) (Grid Map)", pitchGridUI.wrap));
+
+        let slapSel = document.createElement("select");
+        slapSel.style.padding = "4px";
+        slapSel.style.borderRadius = "4px";
+        slapSel.style.backgroundColor = "#1a1a24";
+        slapSel.style.color = "#fff";
+        slapSel.style.border = "1px solid #3f3f4e";
+        [0.70, 0.80].forEach(v => {
+            let opt = document.createElement("option");
+            opt.value = v;
+            opt.innerText = (v * 100).toFixed(0) + "%";
+            if (Math.abs(MAP_PARAMS.slap - v) < 0.01) opt.selected = true;
+            slapSel.appendChild(opt);
+        });
+        form.appendChild(createField("Side Overlap", slapSel));
+
+        modal.appendChild(form);
+
+        let btnBox = document.createElement("div");
+        btnBox.style.display = "flex";
+        btnBox.style.justifyContent = "space-between";
+        btnBox.style.marginTop = "8px";
+
+        let leftBtns = document.createElement("div");
+        leftBtns.style.display = "flex";
+        leftBtns.style.gap = "8px";
+
+        let closeBtn = document.createElement("button");
+        closeBtn.innerText = "Cancel";
+        closeBtn.style.padding = "8px 16px";
+        closeBtn.style.backgroundColor = "transparent";
+        closeBtn.style.color = "#ccc";
+        closeBtn.style.border = "none";
+        closeBtn.style.cursor = "pointer";
+        closeBtn.style.fontFamily = "inherit";
+        closeBtn.onclick = () => document.body.removeChild(overlay);
+
+        let defaultBtn = document.createElement("button");
+        defaultBtn.innerText = "Defaults";
+        defaultBtn.style.padding = "8px 16px";
+        defaultBtn.style.backgroundColor = "transparent";
+        defaultBtn.style.color = "#ccc";
+        defaultBtn.style.border = "1px solid #5a5a6b";
+        defaultBtn.style.borderRadius = "4px";
+        defaultBtn.style.cursor = "pointer";
+        defaultBtn.style.fontFamily = "inherit";
+        defaultBtn.onclick = () => {
+            saveSettings({
+                droneModel: droneSel.value,
+                altitude: 80,
+                gimbalPitch: -90,
+                gimbalPitchGrid: -60,
+                slap: 0.70
+            });
+            document.body.removeChild(overlay);
+            openSettingsModal(); // Reload the modal to show defaults visually
+        };
+
+        leftBtns.appendChild(closeBtn);
+        leftBtns.appendChild(defaultBtn);
+
+        let saveBtn = document.createElement("button");
+        saveBtn.innerText = "Save";
+        saveBtn.style.padding = "8px 16px";
+        saveBtn.style.backgroundColor = "#00ced1"; // Spexi-like cyan tone
+        saveBtn.style.color = "#000";
+        saveBtn.style.border = "none";
+        saveBtn.style.borderRadius = "4px";
+        saveBtn.style.cursor = "pointer";
+        saveBtn.style.fontWeight = "bold";
+        saveBtn.style.fontFamily = "inherit";
+
+        saveBtn.onclick = () => {
+            saveSettings({
+                droneModel: droneSel.value,
+                altitude: parseFloat(altUI.input.value),
+                gimbalPitch: parseFloat(pitchUI.input.value),
+                gimbalPitchGrid: parseFloat(pitchGridUI.input.value),
+                slap: parseFloat(slapSel.value)
+            });
+            document.body.removeChild(overlay);
+        };
+
+        btnBox.appendChild(leftBtns);
+        btnBox.appendChild(saveBtn);
+        modal.appendChild(btnBox);
+        overlay.appendChild(modal);
         document.body.appendChild(overlay);
     }
 
-    function exportFlightPathKML(mission, points) {
-        const header = `<?xml version="1.0" encoding="UTF-8"?>
-  <kml xmlns="http://www.opengis.net/kml/2.2">
-    <Document>
-      <name>${mission.zone_hash}-${mission.flight_plan.name} v${mission.flight_plan.version}</name>
-      <Style id="lineStyle">
-        <LineStyle>
-          <color>ff0000ff</color>
-          <width>2</width>
-        </LineStyle>
-        <PolyStyle>
-          <color>00ffffff</color>
-        </PolyStyle>
-      </Style>
-      <Placemark>
-        <name>Flight Path</name>
-        <styleUrl>#lineStyle</styleUrl>
-        <LineString>
-          <tessellate>1</tessellate>
-          <altitudeMode>relativeToGround</altitudeMode>
-          <coordinates>`;
-        let coords = points.length === 1
-            ? `${points[0][1]},${points[0][0]},0 ${points[0][1]},${points[0][0]},80`
-            : points.map(p => `${p[1]},${p[0]},80`).join(' ');
-        const footer = `</coordinates>
-        </LineString>
-      </Placemark>
-    </Document>
-  </kml>`;
+    function triggerDownload(type, cachedHash) {
+        // Dynamically fetch the hash at click time so it stays accurate if the React DOM didn't reload the button
+        let hash = window.location.pathname.match(/\/zone\/([a-fA-F0-9]+)/)?.[1] || document.querySelector("h1")?.innerText.split(" ")[0];
+        if (!hash) {
+            alert("Could not determine the current Hex Hash from the page.");
+            return;
+        }
 
-        const kml = header + coords + footer;
-        const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
+        let camera = DRONES[DRONE_MODEL];
+        let mission;
+        console.log(`Generating mission type ${type} for hex ${hash}...`);
+
+        try {
+            if (type === 1) mission = generateMapMission(hash, MAP_PARAMS, camera, false);
+            if (type === 2) mission = generateMultiPanoramaMission(hash, PANO_PARAMS, camera);
+            if (type === 3) mission = generatePanoramaMission(hash, PANO_PARAMS, camera);
+            if (type === 4) mission = generateMapMission(hash, { ...MAP_PARAMS, gimbalPitch: MAP_PARAMS.gimbalPitchGrid }, camera, true);
+            if (type === 5) mission = generateHybridMission(hash, MAP_PARAMS, PANO_PARAMS, camera);
+        } catch (e) {
+            alert("Error generating flight path: " + e.message);
+            console.error(e);
+            return;
+        }
+
+        let kml = buildKML(mission, hash, DRONE_MODEL);
+
+        let blob = new Blob([kml], { type: "application/vnd.google-earth.kml+xml" });
+        let url = URL.createObjectURL(blob);
+        let a = document.createElement("a");
         a.href = url;
-        a.download = `${mission.zone_hash}-${mission.flight_plan.name} v${mission.flight_plan.version}.kml`;
+        let typeName = FLIGHT_PLAN_NAMES[type].replace(/\s+/g, "");
+        a.download = `Spexi_${typeName}_${hash}.kml`;
+        document.body.appendChild(a);
         a.click();
+        document.body.removeChild(a);
         URL.revokeObjectURL(url);
     }
 
-    function exportFlightPathGeoJSON(mission, points) {
-        const geojson = {
-            type: 'FeatureCollection',
-            features: [{
-                type: 'Feature',
-                geometry: {
-                    type: 'LineString',
-                    coordinates: points.map(([lat, lng]) => [lng, lat, 80])
-                },
-                properties: {
-                    name: `${mission.zone_hash}-${mission.flight_plan.name} v${mission.flight_plan.version}`
-                }
-            }]
-        };
+    // Set up MutationObserver to repeatedly try injecting if React re-renders card
+    const observer = new MutationObserver(() => injectUI());
+    observer.observe(document.body, { childList: true, subtree: true });
 
-        const blob = new Blob([JSON.stringify(geojson, null, 2)], { type: 'application/geo+json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${mission.zone_hash}-${mission.flight_plan.name} v${mission.flight_plan.version}.geojson`;
-        a.click();
-        URL.revokeObjectURL(url);
-    }
+    // Initial attempt
+    window.addEventListener("load", () => {
+        setTimeout(injectUI, 1000);
+    });
 
-    // SPA Navigation Detection
-    function setupSPADetection() {
-        const origPush = history.pushState;
-        history.pushState = function() {
-            origPush.apply(this, arguments);
-            window.dispatchEvent(new Event('locationchange'));
-        };
-        const origReplace = history.replaceState;
-        history.replaceState = function() {
-            origReplace.apply(this, arguments);
-            window.dispatchEvent(new Event('locationchange'));
-        };
-        window.addEventListener('popstate', () => window.dispatchEvent(new Event('locationchange')));
-        window.addEventListener('locationchange', () => {
-            removePreview();
-            removeMissionSection();
-        });
-    }
-
-    // Initialize
-    setupMapInterception();
-    disableRowHover();
-    overrideFetch();
-    setupSPADetection();
 })();
