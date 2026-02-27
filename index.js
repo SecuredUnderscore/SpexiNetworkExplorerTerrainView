@@ -2,7 +2,7 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1.0
 // @match        https://explorer.spexi.com/*
 // @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
@@ -155,7 +155,9 @@
                     let c = turf.centroid(intersection);
                     panoPoints.push(c.geometry.coordinates);
                 }
-            } catch (e) { console.error("Intersection failed", e); }
+            } catch (e) {
+                // Silently skip failed intersections
+            }
         }
         // Rotate by -1
         if (panoPoints.length > 1) {
@@ -379,12 +381,15 @@
       <LineStyle><color>ff00ff00</color><width>3</width></LineStyle>
       <PolyStyle><fill>0</fill></PolyStyle>
     </Style>`);
-        // pathStyle & transitStyle: solid pink line
+        // pathStyle: solid pink line (AABBGGRR: ff=Alpha, ff=Blue, 00=Green, ff=Red)
         lines.push(`    <Style id="pathStyle">
       <LineStyle><color>ffff00ff</color><width>3</width></LineStyle>
     </Style>`);
+
+        // transitStyle: Yellow for panos, pink for maps
+        let transitColor = (mission.type === "multiPanorama" || mission.type === "hybrid") ? "ff00ffff" : "ffff00ff";
         lines.push(`    <Style id="transitStyle">
-      <LineStyle><color>ffff00ff</color><width>3</width></LineStyle>
+      <LineStyle><color>${transitColor}</color><width>3</width></LineStyle>
     </Style>`);
         lines.push(`    <Style id="panoStyle">
       <IconStyle><color>ff00bbff</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/camera.png</href></Icon></IconStyle>
@@ -819,7 +824,6 @@
 
         let camera = DRONES[DRONE_MODEL];
         let mission;
-        console.log(`Generating mission type ${type} for hex ${hash}...`);
 
         try {
             if (type === 1) mission = generateMapMission(hash, MAP_PARAMS, camera, false);
@@ -847,13 +851,273 @@
         URL.revokeObjectURL(url);
     }
 
-    // Set up MutationObserver to repeatedly try injecting if React re-renders card
-    const observer = new MutationObserver(() => injectUI());
-    observer.observe(document.body, { childList: true, subtree: true });
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Available Missions (API)
+    // ─────────────────────────────────────────────────────────────────────────────
+    const API_BASE = "https://api.explorer.spexi.com/api";
 
-    // Initial attempt
-    window.addEventListener("load", () => {
-        setTimeout(injectUI, 1000);
+    async function fetchMissions(hash) {
+        try {
+            let resp = await fetch(`${API_BASE}/missions?zone_hash=${hash}&status=active`, {
+                credentials: "include",
+                headers: { "Content-Type": "application/json" }
+            });
+            if (!resp.ok) return [];
+            let json = await resp.json();
+            return json.data || [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function formatCurrency(amount, currency) {
+        if (!amount || amount <= 0) return null;
+        let sym = currency === "CAD" ? "CA$" : "$";
+        return `${sym}${(amount / 100).toFixed(2)}`;
+    }
+
+    function groupMissions(missions) {
+        let groups = {};
+        for (let m of missions) {
+            let fpId = m.flight_plan_id || m.flight_plan?.id;
+            if (!groups[fpId]) {
+                groups[fpId] = {
+                    flight_plan_id: fpId,
+                    flight_plan_name: m.flight_plan?.name || FLIGHT_PLAN_NAMES[fpId] || "Unknown",
+                    count: 0,
+                    totalAmount: 0,
+                    totalRp: 0,
+                    totalToken: BigInt(0),
+                    currency: m.currency || "USD"
+                };
+            }
+            groups[fpId].count++;
+            groups[fpId].totalAmount += m.amount || 0;
+            groups[fpId].totalRp += m.rp_amount || 0;
+            try {
+                if (m.token_amount) groups[fpId].totalToken += BigInt(m.token_amount);
+            } catch (e) { }
+        }
+        return Object.values(groups);
+    }
+
+    let _missionFetching = false;
+
+    function injectMissionList(hash) {
+        let existing = document.getElementById("spexi-missions-section");
+        if (existing) existing.remove();
+        if (_missionFetching) return;
+        _missionFetching = true;
+
+        fetchMissions(hash).then(missions => {
+            _missionFetching = false;
+            // Remove again in case one snuck in while we were fetching
+            let dup = document.getElementById("spexi-missions-section");
+            if (dup) dup.remove();
+            // Build the section using the site's own Stitches CSS classes for consistent styling
+            let section = document.createElement("div");
+            section.id = "spexi-missions-section";
+            section.className = "c-FNXti c-FNXti-hVCjZQ-background-darken c-FNXti-ivYAPe-padding-none c-FNXti-iydAuT-inlaid-true";
+            section.style.padding = "12px 16px";
+
+            // Header row: title + badge
+            let header = document.createElement("div");
+            header.className = "c-kiAJIg c-kiAJIg-knmidH-justify-spaced c-kiAJIg-eKWVTQ-spacing-m";
+            header.style.marginBottom = "8px";
+            header.style.display = "flex";
+            header.style.alignItems = "center";
+
+            let titleP = document.createElement("p");
+            titleP.className = "c-lbNOYO c-lbNOYO-jwYGDW-variant-primary_header";
+            let titleSpan = document.createElement("span");
+            titleSpan.className = "c-jgPCyX c-jgPCyX-eKvWLo-variant-subtle";
+            titleSpan.textContent = "Available Missions";
+            titleP.appendChild(titleSpan);
+            header.appendChild(titleP);
+
+            let badge = document.createElement("span");
+            badge.style.fontSize = "11px";
+            badge.style.padding = "2px 8px";
+            badge.style.borderRadius = "10px";
+            badge.style.backgroundColor = missions.length > 0 ? "#1a6b3a" : "#5a5a6b";
+            badge.style.color = "#fff";
+            badge.style.flexShrink = "0";
+            badge.textContent = missions.length > 0 ? `${missions.length} active` : "None";
+            header.appendChild(badge);
+
+            section.appendChild(header);
+
+            if (missions.length === 0) {
+                let empty = document.createElement("p");
+                empty.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs";
+                empty.textContent = "No active missions for this zone.";
+                section.appendChild(empty);
+            } else {
+                let grouped = groupMissions(missions);
+                grouped.forEach(g => {
+                    let row = document.createElement("div");
+                    row.className = "c-kiAJIg c-kiAJIg-knmidH-justify-spaced";
+                    row.style.display = "flex";
+                    row.style.alignItems = "center";
+                    row.style.padding = "12px 0";
+                    row.style.gap = "14px";
+                    row.style.borderBottom = "1px solid rgba(255,255,255,0.06)";
+
+                    let info = document.createElement("div");
+                    info.className = "c-kiAJIg c-kiAJIg-iTKOFX-dir-v c-kiAJIg-kdofoX-spacing-xs";
+
+                    let nameEl = document.createElement("p");
+                    nameEl.className = "c-lbNOYO c-lbNOYO-kpetlT-variant-primary_body c-lbNOYO-dKdvLu-size-s c-lbNOYO-iqKmYR-weight-medium";
+                    let countLabel = g.count > 1 ? ` (×${g.count})` : "";
+                    nameEl.textContent = `${g.flight_plan_name}${countLabel}`;
+                    info.appendChild(nameEl);
+
+                    let rewardParts = [];
+                    let cashStr = formatCurrency(g.totalAmount, g.currency);
+                    if (cashStr) rewardParts.push(cashStr);
+                    if (g.totalRp > 0) rewardParts.push(`+${g.totalRp} RP`);
+                    if (g.totalToken > BigInt(0)) {
+                        let tokenStr = (Number(g.totalToken) / 1e18).toFixed(2);
+                        rewardParts.push(`+${tokenStr} DRONE`);
+                    }
+
+                    if (rewardParts.length > 0) {
+                        let rewardEl = document.createElement("p");
+                        rewardEl.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs c-lbNOYO-iqKmYR-weight-medium";
+                        rewardEl.style.color = "#88d8b0";
+                        rewardEl.textContent = rewardParts.join("  ");
+                        info.appendChild(rewardEl);
+                    }
+
+                    row.appendChild(info);
+
+                    let dlBtn = document.createElement("button");
+                    dlBtn.className = "c-kSHLrh c-kSHLrh-imStlG-variant-neutral_text c-kSHLrh-fyQYCy-size-s PJLV";
+                    dlBtn.style.flexShrink = "0";
+                    dlBtn.textContent = "📥 KML";
+
+                    dlBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        triggerDownload(g.flight_plan_id, hash);
+                    };
+
+                    row.appendChild(dlBtn);
+                    section.appendChild(row);
+                });
+            }
+
+            // Strategy 1: Find exact "24 hr Weather" leaf text element using TreeWalker
+            let inserted = false;
+            let walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let textNode;
+            while (textNode = walker.nextNode()) {
+                if (textNode.textContent.trim() === "24 hr Weather") {
+                    // Walk up from the text node to find the outermost weather section container
+                    let el = textNode.parentElement;
+                    let candidate = el;
+                    // Keep walking up until we find a container whose parent holds multiple top-level sections
+                    // (the scrollable area that contains weather, flight history, etc.)
+                    for (let i = 0; i < 8 && el; i++) {
+                        if (el.parentElement && el.parentElement.children.length > 2) {
+                            // This parent has many children — el is the weather section block
+                            candidate = el;
+                            break;
+                        }
+                        candidate = el;
+                        el = el.parentElement;
+                    }
+                    candidate.parentElement.insertBefore(section, candidate);
+                    inserted = true;
+                    break;
+                }
+            }
+
+            // Strategy 2: Fallback — find "View in Google Maps" button and insert before its container
+            if (!inserted) {
+                let buttons = Array.from(document.querySelectorAll("button"));
+                let gmapBtn = buttons.find(b => b.innerText && b.innerText.includes("View in Google Maps"));
+                if (gmapBtn) {
+                    let container = gmapBtn.parentElement;
+                    if (container) {
+                        container.insertBefore(section, gmapBtn);
+                        inserted = true;
+                    }
+                }
+            }
+
+            // Strategy 3: Last resort — find scrollable container via attribute
+            if (!inserted) {
+                let scrollable = document.querySelector("[scrollable='true']") || document.querySelector("[data-scrollable]");
+                if (scrollable) {
+                    scrollable.prepend(section);
+                    inserted = true;
+                }
+            }
+
+            if (!inserted) {
+                // Silently fail if insertion points aren't found
+            }
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Zone Change Detection & Initialization
+    // ─────────────────────────────────────────────────────────────────────────────
+    let lastZoneHash = null;
+
+    function getCurrentZoneHash() {
+        let m = window.location.pathname.match(/\/zone\/([a-fA-F0-9]+)/);
+        return m ? m[1] : null;
+    }
+
+    function onZoneChange(hash) {
+        if (!hash) return;
+        lastZoneHash = hash;
+        injectMissionList(hash);
+    }
+
+    function checkForZoneChange() {
+        let hash = getCurrentZoneHash();
+        if (hash && hash !== lastZoneHash) {
+            onZoneChange(hash);
+        } else if (hash && hash === lastZoneHash && !document.getElementById("spexi-missions-section")) {
+            // React re-rendered and removed our section — re-inject
+            injectMissionList(hash);
+        }
+    }
+
+    // MutationObserver for UI injection + zone change detection
+    const observer = new MutationObserver(() => {
+        injectUI();
+        checkForZoneChange();
     });
+
+    function startObserving() {
+        if (document.body) {
+            observer.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => {
+                injectUI();
+                checkForZoneChange();
+            }, 1000);
+        } else {
+            document.addEventListener("DOMContentLoaded", () => {
+                observer.observe(document.body, { childList: true, subtree: true });
+                setTimeout(() => {
+                    injectUI();
+                    checkForZoneChange();
+                }, 1000);
+            });
+        }
+    }
+
+    // Also watch for pushState/popState URL changes (SPA navigation)
+    let origPushState = history.pushState;
+    history.pushState = function () {
+        origPushState.apply(this, arguments);
+        setTimeout(checkForZoneChange, 300);
+    };
+    window.addEventListener("popstate", () => setTimeout(checkForZoneChange, 300));
+
+    startObserving();
 
 })();
