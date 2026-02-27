@@ -7,6 +7,8 @@ Features:
 
 - Flight plan export to Google Earth: For any Spexigon that is on the map (Locked or Unlocked), choose the Download Flight Path dropdown at the bottom of the Spexigon card and select a flight plan type (Multi Panorama, Map, etc). In the dropdown, change flight settings (Drone Model (Different Sensors will result in different geometry), and all Trusted Pilot parameters (Altitude, SLAP, and Gimbal pitch)) to accurately adjust the generated geometry. Flight path geometry should be 1:1 to the Spexi app as all logic & math was taken directly from the Spexi app's source code.
 
+- List currently available Missions for a selected Spexigon, includes Mission Type, Rewards, and flight plan download button (For Google Earth)
+  
 
 Installation:
 
