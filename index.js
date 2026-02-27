@@ -2,7 +2,7 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
+// @version      3.1.1
 // @match        https://explorer.spexi.com/*
 // @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
@@ -340,15 +340,94 @@
         let newParams = { ...params, isGridMap: isGrid };
         let flightData = generateMapPath(hash, newParams, camera);
         let waypoints = buildMapWaypoints(flightData, newParams);
-        return { type: isGrid ? "gridMap" : "map", waypoints, pano_points: [], flight_coords: flightData.coords, photo_count: waypoints.length, gsd: flightData.gsd, line_spacing: flightData.line_spacing, photo_interval: flightData.photo_interval };
+
+        // Group waypoints into flight lines for KML rendering at real waypoint density
+        let flightLineGroups = [];
+        let currentLine = [];
+        for (let wp of waypoints) {
+            currentLine.push([wp.longitude, wp.latitude]);
+            if (wp.isFlightLineEnd) {
+                if (currentLine.length >= 2) flightLineGroups.push(currentLine);
+                currentLine = [];
+            }
+        }
+        if (currentLine.length >= 2) flightLineGroups.push(currentLine);
+
+        return { type: isGrid ? "gridMap" : "map", waypoints, pano_points: [], flight_coords: flightData.coords, flight_lines: flightLineGroups, photo_count: waypoints.length, gsd: flightData.gsd, line_spacing: flightData.line_spacing, photo_interval: flightData.photo_interval };
+    }
+
+    // ── Hybrid: Snap & Interleave (matches app logic) ────────────────────────
+    function snapAndInterleave(mapWaypoints, panoPoints, panoParams, camera) {
+        let panoActions = getPanoActions(camera, panoParams);
+        let usedIndices = new Set();
+        let assignments = [];
+
+        // Step 1: For each pano, find nearest unused map waypoint
+        for (let pi = 0; pi < panoPoints.length; pi++) {
+            let pano = panoPoints[pi];
+            let bestDist = Infinity;
+            let bestIdx = -1;
+            for (let mi = 0; mi < mapWaypoints.length; mi++) {
+                if (usedIndices.has(mi)) continue;
+                let d = distanceMeters([mapWaypoints[mi].longitude, mapWaypoints[mi].latitude], pano);
+                if (d < bestDist) { bestDist = d; bestIdx = mi; }
+            }
+            if (bestIdx >= 0) {
+                usedIndices.add(bestIdx);
+                assignments.push({ panoIdx: pi, mapIdx: bestIdx });
+            }
+        }
+
+        // Step 2: Sort by map index so panos are visited in scan order
+        assignments.sort((a, b) => a.mapIdx - b.mapIdx);
+
+        // Step 3: Interleave — insert pano at matched map waypoint position
+        let result = [];
+        let cursor = 0;
+        for (let a of assignments) {
+            while (cursor < a.mapIdx) { result.push(mapWaypoints[cursor]); cursor++; }
+            let mw = mapWaypoints[a.mapIdx];
+            result.push(buildPanoWaypoint(mw.longitude, mw.latitude, panoParams.altitude, panoParams.speed, panoActions));
+            cursor++; // skip past the replaced map waypoint
+        }
+        while (cursor < mapWaypoints.length) { result.push(mapWaypoints[cursor]); cursor++; }
+
+        return result;
     }
 
     function generateHybridMission(hash, mapParams, panoParams, camera) {
         let mapMission = generateMapMission(hash, mapParams, camera);
         let panoPoints = getHexPanos(hash);
-        let actions = getPanoActions(camera, panoParams);
-        let panoWaypoints = panoPoints.map(pt => buildPanoWaypoint(pt[0], pt[1], panoParams.altitude, panoParams.speed, actions));
-        return { type: "hybrid", waypoints: [...mapMission.waypoints, ...panoWaypoints], pano_points: panoPoints, flight_coords: mapMission.flight_coords, photo_count: mapMission.photo_count + (actions.length * panoPoints.length), gsd: mapMission.gsd, line_spacing: mapMission.line_spacing, photo_interval: mapMission.photo_interval };
+        let interleaved = snapAndInterleave(mapMission.waypoints, panoPoints, panoParams, camera);
+
+        // Group into flight lines (same logic, skipping pano waypoints for line grouping)
+        let flightLineGroups = [];
+        let currentLine = [];
+        for (let wp of interleaved) {
+            if (wp.imageTag === "pano") continue;
+            currentLine.push([wp.longitude, wp.latitude]);
+            if (wp.isFlightLineEnd) {
+                if (currentLine.length >= 2) flightLineGroups.push(currentLine);
+                currentLine = [];
+            }
+        }
+        if (currentLine.length >= 2) flightLineGroups.push(currentLine);
+
+        let panoMarkers = interleaved.filter(wp => wp.imageTag === "pano").map(wp => [wp.longitude, wp.latitude]);
+        let panoActions = getPanoActions(camera, panoParams);
+        let photoCount = interleaved.reduce((sum, wp) => sum + (wp.actions ? wp.actions.length : 0), 0);
+
+        return {
+            type: "hybrid",
+            waypoints: interleaved,
+            pano_points: panoMarkers,
+            flight_coords: mapMission.flight_coords,
+            flight_lines: flightLineGroups,
+            photo_count: photoCount,
+            gsd: mapMission.gsd,
+            line_spacing: mapMission.line_spacing,
+            photo_interval: mapMission.photo_interval
+        };
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -439,27 +518,43 @@
         </Polygon>
       </Placemark></Folder>`);
 
-        // Path Feature
-        if (mission.flight_coords && mission.flight_coords.length >= 2) {
+        // Path Feature — uses real waypoint density when available
+        if (mission.flight_lines && mission.flight_lines.length > 0) {
             let mapAlt = MAP_PARAMS.altitude;
             lines.push(`    <Folder><name>Flight Path</name>`);
-            // Draw lines
-            for (let i = 0; i < mission.flight_coords.length - 1; i += 2) {
-                if (i + 1 < mission.flight_coords.length) {
-                    let start = mission.flight_coords[i], end = mission.flight_coords[i + 1];
-                    let lineStr = interpolateLineStr(start, end, mapAlt);
-                    lines.push(`      <Placemark><name>Flight Line ${i / 2 + 1}</name><styleUrl>#pathStyle</styleUrl>
-        <LineString><altitudeMode>relativeToGround</altitudeMode><tessellate>1</tessellate><coordinates>${lineStr}</coordinates></LineString></Placemark>`);
+
+            // Draw flight lines through all waypoint positions
+            mission.flight_lines.forEach((line, i) => {
+                let coordParts = [];
+                for (let j = 0; j < line.length - 1; j++) {
+                    coordParts.push(interpolateLineStr(line[j], line[j + 1], mapAlt));
                 }
+                let lineStr = coordParts.join(' ');
+                lines.push(`      <Placemark><name>Flight Line ${i + 1}</name><styleUrl>#pathStyle</styleUrl>
+        <LineString><altitudeMode>relativeToGround</altitudeMode><tessellate>1</tessellate><coordinates>${lineStr}</coordinates></LineString></Placemark>`);
+            });
+
+            // Draw transits between flight lines
+            for (let i = 0; i < mission.flight_lines.length - 1; i++) {
+                let prevLine = mission.flight_lines[i];
+                let nextLine = mission.flight_lines[i + 1];
+                let start = prevLine[prevLine.length - 1];
+                let end = nextLine[0];
+                let lineStr = interpolateLineStr(start, end, mapAlt);
+                lines.push(`      <Placemark><name>Transit ${i + 1}</name><styleUrl>#transitStyle</styleUrl>
+        <LineString><altitudeMode>relativeToGround</altitudeMode><tessellate>1</tessellate><coordinates>${lineStr}</coordinates></LineString></Placemark>`);
             }
-            // Draw transits
-            for (let i = 1; i < mission.flight_coords.length - 1; i += 2) {
-                if (i + 1 < mission.flight_coords.length) {
-                    let start = mission.flight_coords[i], end = mission.flight_coords[i + 1];
-                    let lineStr = interpolateLineStr(start, end, mapAlt);
-                    lines.push(`      <Placemark><name>Transit ${Math.floor(i / 2) + 1}</name><styleUrl>#transitStyle</styleUrl>
+
+            lines.push(`    </Folder>`);
+        } else if (mission.flight_coords && mission.flight_coords.length >= 2) {
+            // Fallback: pair-based rendering (multi-panorama transit paths)
+            let mapAlt = MAP_PARAMS.altitude;
+            lines.push(`    <Folder><name>Flight Path</name>`);
+            for (let i = 0; i < mission.flight_coords.length - 1; i++) {
+                let start = mission.flight_coords[i], end = mission.flight_coords[i + 1];
+                let lineStr = interpolateLineStr(start, end, mapAlt);
+                lines.push(`      <Placemark><name>Transit ${i + 1}</name><styleUrl>#transitStyle</styleUrl>
         <LineString><altitudeMode>relativeToGround</altitudeMode><tessellate>1</tessellate><coordinates>${lineStr}</coordinates></LineString></Placemark>`);
-                }
             }
             lines.push(`    </Folder>`);
         }
