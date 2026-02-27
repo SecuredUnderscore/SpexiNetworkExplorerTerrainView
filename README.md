@@ -5,15 +5,7 @@ Helper to visualize and plan Spexi missions
 
 Features:
 
-- 3D Terrain Toggle
-  Toggle 3D terrain on the map using the new 3D button at the bottom right
-
-- Mission List
-  When selecting a Spexigon, list all available missions with details about the type, reward, and creation time.
-
-- Flight Plan Export and Preview
-  Export an available mission's flight plan using the new Export button. Current format support: .kml (Google Earth), and .geojson. All mission types supported: Map, Multi Panorama, Panorama, and Grid Map. Multi Panorama and Panorama are accurate to <2m, although the order of the Multi Panorama waypoints will most likely be wrong. Map and Grid Map export should only be used for planning (scouting out pilot position), the actual flight paths are likely to be wrong in some way.
-  Preview an available mission's flight plan on the Spexi Network Explorer using the new Preview button. Panorama and Multi Panorama missions only render the pano locations at the correct location and altitude. Map and Grid Map missions only render the flight paths at ground level, if you want 3D visualization, use Export.
+- Flight plan export to Google Earth: For any Spexigon that is on the map (Locked or Unlocked), choose the Download Flight Path dropdown at the bottom of the Spexigon card and select a flight plan type (Multi Panorama, Map, etc). In the dropdown, change flight settings (Drone Model (Different Sensors will result in different geometry), and all Trusted Pilot parameters (Altitude, SLAP, and Gimbal pitch)) to accurately adjust the generated geometry. Flight path geometry should be 1:1 to the Spexi app as all logic & math was taken directly from the Spexi app's source code.
 
 
 Installation:
