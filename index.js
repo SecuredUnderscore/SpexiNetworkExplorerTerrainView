@@ -2,7 +2,7 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      3.1.1
+// @version      3.2.1
 // @match        https://explorer.spexi.com/*
 // @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
@@ -325,8 +325,10 @@
             if (segLength > 0 && photoInterval > 0) {
                 let dist = photoInterval;
                 while (dist < segLength) {
-                    let pt = pointAlongLine(start, end, dist / segLength);
-                    waypoints.push({ longitude: roundCoord(pt[0]), latitude: roundCoord(pt[1]), altitude: flightData.flying_height, actions: [action], speed, isFlyThrough: true, isFlightLineStart: false, isFlightLineEnd: false, imageTag: flightData.image_tag });
+                    if ((segLength - dist) >= (photoInterval / 3)) {
+                        let pt = pointAlongLine(start, end, dist / segLength);
+                        waypoints.push({ longitude: roundCoord(pt[0]), latitude: roundCoord(pt[1]), altitude: flightData.flying_height, actions: [action], speed, isFlyThrough: true, isFlightLineStart: false, isFlightLineEnd: false, imageTag: flightData.image_tag });
+                    }
                     dist += photoInterval;
                 }
             }
@@ -452,7 +454,15 @@
         if (mission.type === "multiPanorama") missionName = "Multi-Panorama";
         if (mission.type === "gridMap") missionName = "Grid Map";
 
-        lines.push(`    <name>Spexi ${missionName} Mission</name>`);
+        lines.push(`    <name>Spexi ${hash}-${missionName}</name>`);
+
+        // Extended Metadata
+        lines.push(`    <ExtendedData>`);
+        lines.push(`      <Data name="ImageCount"><value>${mission.photo_count || 0}</value></Data>`);
+        if (droneModel) lines.push(`      <Data name="DroneModel"><value>${escapeXml(droneModel)}</value></Data>`);
+        lines.push(`      <Data name="MissionType"><value>${missionName}</value></Data>`);
+        lines.push(`      <Data name="ZoneHash"><value>${hash}</value></Data>`);
+        lines.push(`    </ExtendedData>`);
 
         // Styles
         // hexStyle: solid green border (ff alpha, 00=B, ff=G, 00=R), no fill
@@ -465,16 +475,27 @@
       <LineStyle><color>ffff00ff</color><width>3</width></LineStyle>
     </Style>`);
 
-        // transitStyle: Yellow for panos, pink for maps
-        let transitColor = (mission.type === "multiPanorama" || mission.type === "hybrid") ? "ff00ffff" : "ffff00ff";
+        // transitStyle: Orange for all transit lines (AABBGGRR: ff=Alpha, 00=Blue, a5=Green, ff=Red)
         lines.push(`    <Style id="transitStyle">
-      <LineStyle><color>${transitColor}</color><width>3</width></LineStyle>
+      <LineStyle><color>ff00a5ff</color><width>3</width></LineStyle>
     </Style>`);
         lines.push(`    <Style id="panoStyle">
       <IconStyle><color>ff00bbff</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/camera.png</href></Icon></IconStyle>
     </Style>`);
+        lines.push(`    <Style id="imageStyle">
+      <IconStyle><color>ff00ff00</color><scale>0.8</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/camera.png</href></Icon></IconStyle>
+    </Style>`);
         lines.push(`    <Style id="panoPathStyle">
       <LineStyle><color>ffff00ff</color><width>2</width></LineStyle>
+    </Style>`);
+        // Start/End point styles
+        lines.push(`    <Style id="startStyle">
+      <IconStyle><color>ff00ff00</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/grn-circle.png</href></Icon></IconStyle>
+      <LabelStyle><scale>0.9</scale></LabelStyle>
+    </Style>`);
+        lines.push(`    <Style id="endStyle">
+      <IconStyle><color>ff0000ff</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon></IconStyle>
+      <LabelStyle><scale>0.9</scale></LabelStyle>
     </Style>`);
 
         // Helper to interpolate points for terrain following
@@ -510,8 +531,8 @@
         hexCoordsInterp.push(`${roundCoord(hexCoords[hexCoords.length - 1][0])},${roundCoord(hexCoords[hexCoords.length - 1][1])},${hexAlt}`);
         let coordsStr = hexCoordsInterp.join(' ');
 
-        lines.push(`    <Folder><name>Hex Boundary</name>
-      <Placemark><name>Spexigon ${hash}</name><styleUrl>#hexStyle</styleUrl>
+        lines.push(`    <Folder><name>Hex Boundary</name><visibility>0</visibility>
+      <Placemark><name>Spexigon ${hash}</name><visibility>0</visibility><styleUrl>#hexStyle</styleUrl>
         <Polygon><altitudeMode>relativeToGround</altitudeMode>
           <tessellate>1</tessellate>
           <outerBoundaryIs><LinearRing><coordinates>${coordsStr}</coordinates></LinearRing></outerBoundaryIs>
@@ -546,6 +567,20 @@
             }
 
             lines.push(`    </Folder>`);
+
+            // Start and End points for map/gridMap/hybrid missions
+            if (["map", "gridMap", "hybrid"].includes(mission.type)) {
+                let firstLine = mission.flight_lines[0];
+                let lastLine = mission.flight_lines[mission.flight_lines.length - 1];
+                let startPt = firstLine[0];
+                let endPt = lastLine[lastLine.length - 1];
+                lines.push(`    <Folder><name>Start / End</name>`);
+                lines.push(`      <Placemark><name>Start</name><styleUrl>#startStyle</styleUrl>
+        <Point><altitudeMode>relativeToGround</altitudeMode><coordinates>${roundCoord(startPt[0])},${roundCoord(startPt[1])},${mapAlt}</coordinates></Point></Placemark>`);
+                lines.push(`      <Placemark><name>End</name><styleUrl>#endStyle</styleUrl>
+        <Point><altitudeMode>relativeToGround</altitudeMode><coordinates>${roundCoord(endPt[0])},${roundCoord(endPt[1])},${mapAlt}</coordinates></Point></Placemark>`);
+                lines.push(`    </Folder>`);
+            }
         } else if (mission.flight_coords && mission.flight_coords.length >= 2) {
             // Fallback: pair-based rendering (multi-panorama transit paths)
             let mapAlt = MAP_PARAMS.altitude;
@@ -563,9 +598,20 @@
             lines.push(`    <Folder><name>Panorama Locations</name>`);
             let panoAlt = PANO_PARAMS.altitude;
             mission.pano_points.forEach((pt, idx) => {
-                let name = (idx === 0 && mission.pano_points.length > 1) ? "Center Pano" : `Pano ${idx + 1}`;
+                let name = `Pano ${idx + 1}`;
                 lines.push(`      <Placemark><name>${name}</name><styleUrl>#panoStyle</styleUrl>
         <Point><altitudeMode>relativeToGround</altitudeMode><coordinates>${pt[0]},${pt[1]},${panoAlt}</coordinates></Point></Placemark>`);
+            });
+            lines.push(`    </Folder>`);
+        }
+
+        let mapWaypoints = mission.waypoints ? mission.waypoints.filter(wp => wp.imageTag !== 'pano') : [];
+        if (mapWaypoints.length > 0) {
+            lines.push(`    <Folder><name>Image Locations</name><visibility>0</visibility>`);
+            mapWaypoints.forEach((wp, idx) => {
+                let name = `Image ${idx + 1}`;
+                lines.push(`      <Placemark><name>${name}</name><visibility>0</visibility><styleUrl>#imageStyle</styleUrl>
+        <Point><altitudeMode>relativeToGround</altitudeMode><coordinates>${wp.longitude},${wp.latitude},${wp.altitude}</coordinates></Point></Placemark>`);
             });
             lines.push(`    </Folder>`);
         }
@@ -606,6 +652,7 @@
         dlBtn.className = viewMapBtn.className;
         dlBtn.style.marginLeft = "8px";
         dlBtn.style.cursor = "pointer";
+        dlBtn.title = "Generate and download a KML flight path for Google Earth";
 
         let dropdown = document.createElement("div");
         dropdown.style.display = "none";
@@ -951,6 +998,29 @@
     // ─────────────────────────────────────────────────────────────────────────────
     const API_BASE = "https://api.explorer.spexi.com/api";
 
+    // ── USDC → CAD conversion rate (cached) ─────────────────────────────────
+    let _usdcCadRate = null;
+    let _usdcCadRateTimestamp = 0;
+    const RATE_CACHE_MS = 5 * 60 * 1000; // cache for 5 minutes
+
+    async function fetchUsdcCadRate() {
+        if (_usdcCadRate !== null && (Date.now() - _usdcCadRateTimestamp) < RATE_CACHE_MS) {
+            return _usdcCadRate;
+        }
+        try {
+            let resp = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=cad");
+            if (!resp.ok) return _usdcCadRate; // return stale if available
+            let json = await resp.json();
+            if (json["usd-coin"] && json["usd-coin"].cad) {
+                _usdcCadRate = json["usd-coin"].cad;
+                _usdcCadRateTimestamp = Date.now();
+            }
+        } catch (e) {
+            console.warn("[Spexi Tools] Failed to fetch USDC/CAD rate:", e);
+        }
+        return _usdcCadRate;
+    }
+
     async function fetchMissions(hash) {
         try {
             let resp = await fetch(`${API_BASE}/missions?zone_hash=${hash}&status=active`, {
@@ -982,16 +1052,16 @@
                     count: 0,
                     totalAmount: 0,
                     totalRp: 0,
-                    totalToken: BigInt(0),
+                    totalUsdc: 0,
                     currency: m.currency || "USD"
                 };
             }
             groups[fpId].count++;
             groups[fpId].totalAmount += m.amount || 0;
             groups[fpId].totalRp += m.rp_amount || 0;
-            try {
-                if (m.token_amount) groups[fpId].totalToken += BigInt(m.token_amount);
-            } catch (e) { }
+            if (m.token_amount) {
+                groups[fpId].totalUsdc += Number(m.token_amount) / 1e6;
+            }
         }
         return Object.values(groups);
     }
@@ -1004,7 +1074,8 @@
         if (_missionFetching) return;
         _missionFetching = true;
 
-        fetchMissions(hash).then(missions => {
+        // Fetch missions and USDC/CAD rate in parallel
+        Promise.all([fetchMissions(hash), fetchUsdcCadRate()]).then(([missions, usdcCadRate]) => {
             _missionFetching = false;
             // Remove again in case one snuck in while we were fetching
             let dup = document.getElementById("spexi-missions-section");
@@ -1042,6 +1113,16 @@
 
             section.appendChild(header);
 
+            // Show USDC/CAD rate info if available
+            if (usdcCadRate && missions.length > 0) {
+                let rateInfo = document.createElement("p");
+                rateInfo.style.fontSize = "11px";
+                rateInfo.style.color = "#888";
+                rateInfo.style.marginBottom = "4px";
+                rateInfo.innerHTML = `1 USDC ≈ <span style="color:rgb(255,204,0)">CA$${usdcCadRate.toFixed(4)}</span>`;
+                section.appendChild(rateInfo);
+            }
+
             if (missions.length === 0) {
                 let empty = document.createElement("p");
                 empty.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs";
@@ -1067,20 +1148,24 @@
                     nameEl.textContent = `${g.flight_plan_name}${countLabel}`;
                     info.appendChild(nameEl);
 
-                    let rewardParts = [];
+                    let rewardSpans = [];
                     let cashStr = formatCurrency(g.totalAmount, g.currency);
-                    if (cashStr) rewardParts.push(cashStr);
-                    if (g.totalRp > 0) rewardParts.push(`+${g.totalRp} RP`);
-                    if (g.totalToken > BigInt(0)) {
-                        let tokenStr = (Number(g.totalToken) / 1e18).toFixed(2);
-                        rewardParts.push(`+${tokenStr} DRONE`);
+                    if (cashStr) rewardSpans.push(`<span>${cashStr}</span>`);
+                    if (g.totalUsdc > 0) {
+                        let usdcStr = g.totalUsdc.toFixed(2);
+                        rewardSpans.push(`<span>+${usdcStr} USDC</span>`);
+                        if (usdcCadRate) {
+                            let cadEquiv = (g.totalUsdc * usdcCadRate).toFixed(2);
+                            rewardSpans.push(`<span style="color:rgb(255,204,0)">≈ CA$${cadEquiv}</span>`);
+                        }
                     }
+                    if (g.totalRp > 0) rewardSpans.push(`<span style="color:#fff">+${g.totalRp} RP</span>`);
 
-                    if (rewardParts.length > 0) {
+                    if (rewardSpans.length > 0) {
                         let rewardEl = document.createElement("p");
                         rewardEl.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs c-lbNOYO-iqKmYR-weight-medium";
                         rewardEl.style.color = "#88d8b0";
-                        rewardEl.textContent = rewardParts.join("  ");
+                        rewardEl.innerHTML = rewardSpans.join("&nbsp;&nbsp;");
                         info.appendChild(rewardEl);
                     }
 
@@ -1090,6 +1175,7 @@
                     dlBtn.className = "c-kSHLrh c-kSHLrh-imStlG-variant-neutral_text c-kSHLrh-fyQYCy-size-s PJLV";
                     dlBtn.style.flexShrink = "0";
                     dlBtn.textContent = "📥 KML";
+                    dlBtn.title = "Download KML flight path for this mission type";
 
                     dlBtn.onclick = (e) => {
                         e.stopPropagation();
