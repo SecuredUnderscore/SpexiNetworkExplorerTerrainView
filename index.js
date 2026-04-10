@@ -2,7 +2,7 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      3.4.0
+// @version      3.5.0
 // @match        https://explorer.spexi.com/*
 // @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
@@ -1019,7 +1019,7 @@
     // ─────────────────────────────────────────────────────────────────────────────
     const API_BASE = "https://api.explorer.spexi.com/api";
 
-    // ── USDC → CAD conversion rate (cached) ─────────────────────────────────
+    // ── USDC conversion rates (cached) ─────────────────────────────────────
     let _usdcCadRate = null;
     let _usdcCadRateTimestamp = 0;
     const RATE_CACHE_MS = 5 * 60 * 1000; // cache for 5 minutes
@@ -1305,100 +1305,130 @@
         if (_missionFetching) return;
         _missionFetching = true;
 
-        // Fetch missions and USDC/CAD rate in parallel
-        Promise.all([fetchMissions(hash), fetchUsdcCadRate()]).then(([missions, usdcCadRate]) => {
-            _missionFetching = false;
-            // Remove again in case one snuck in while we were fetching
-            let dup = document.getElementById("spexi-missions-section");
-            if (dup) dup.remove();
-            // Build the section using the site's own Stitches CSS classes for consistent styling
-            let section = document.createElement("div");
-            section.id = "spexi-missions-section";
-            section.className = "c-FNXti c-FNXti-hVCjZQ-background-darken c-FNXti-ivYAPe-padding-none c-FNXti-iydAuT-inlaid-true";
-            section.style.padding = "12px 16px";
+        // Determine what data to fetch based on whether we know the country yet
+        // Zone info may already be cached from the reservation timer
+        let zoneInfoPromise;
+        if (_reservationCache.hash === hash && _reservationCache.data) {
+            zoneInfoPromise = Promise.resolve(_reservationCache.data);
+        } else {
+            zoneInfoPromise = fetchZoneInfo(hash).then(data => {
+                if (data) _reservationCache = { hash, data, fetching: false };
+                return data;
+            });
+        }
 
-            // Header row: title + badge
-            let header = document.createElement("div");
-            header.className = "c-kiAJIg c-kiAJIg-knmidH-justify-spaced c-kiAJIg-eKWVTQ-spacing-m";
-            header.style.marginBottom = "8px";
-            header.style.display = "flex";
-            header.style.alignItems = "center";
+        // Fetch missions, zone info, and (conditionally) the CAD rate in parallel
+        Promise.all([fetchMissions(hash), zoneInfoPromise]).then(([missions, zoneData]) => {
+            let country = zoneData?.country || null;
 
-            let titleP = document.createElement("p");
-            titleP.className = "c-lbNOYO c-lbNOYO-jwYGDW-variant-primary_header";
-            let titleSpan = document.createElement("span");
-            titleSpan.className = "c-jgPCyX c-jgPCyX-eKvWLo-variant-subtle";
-            titleSpan.textContent = "Available Missions";
-            titleP.appendChild(titleSpan);
-            header.appendChild(titleP);
+            // Only fetch CAD rate if zone is in Canada
+            let ratePromise = (country === "CA") ? fetchUsdcCadRate() : Promise.resolve(null);
 
-            let badge = document.createElement("span");
-            badge.style.fontSize = "11px";
-            badge.style.padding = "2px 8px";
-            badge.style.borderRadius = "10px";
-            badge.style.backgroundColor = missions.length > 0 ? "#1a6b3a" : "#5a5a6b";
-            badge.style.color = "#fff";
-            badge.style.flexShrink = "0";
-            badge.textContent = missions.length > 0 ? `${missions.length} active` : "None";
-            header.appendChild(badge);
+            return ratePromise.then(usdcCadRate => {
+                _missionFetching = false;
+                // Remove again in case one snuck in while we were fetching
+                let dup = document.getElementById("spexi-missions-section");
+                if (dup) dup.remove();
+                // Build the section using the site's own Stitches CSS classes for consistent styling
+                let section = document.createElement("div");
+                section.id = "spexi-missions-section";
+                section.className = "c-FNXti c-FNXti-hVCjZQ-background-darken c-FNXti-ivYAPe-padding-none c-FNXti-iydAuT-inlaid-true";
+                section.style.padding = "12px 16px";
 
-            section.appendChild(header);
+                // Header row: title + badge
+                let header = document.createElement("div");
+                header.className = "c-kiAJIg c-kiAJIg-knmidH-justify-spaced c-kiAJIg-eKWVTQ-spacing-m";
+                header.style.marginBottom = "8px";
+                header.style.display = "flex";
+                header.style.alignItems = "center";
 
-            // Show USDC/CAD rate info if available
-            if (usdcCadRate && missions.length > 0) {
-                let rateInfo = document.createElement("p");
-                rateInfo.style.fontSize = "11px";
-                rateInfo.style.color = "#888";
-                rateInfo.style.marginBottom = "4px";
-                rateInfo.innerHTML = `1 USDC ≈ <span style="color:rgb(255,204,0)">CA$${usdcCadRate.toFixed(4)}</span>`;
-                section.appendChild(rateInfo);
-            }
+                let titleP = document.createElement("p");
+                titleP.className = "c-lbNOYO c-lbNOYO-jwYGDW-variant-primary_header";
+                let titleSpan = document.createElement("span");
+                titleSpan.className = "c-jgPCyX c-jgPCyX-eKvWLo-variant-subtle";
+                titleSpan.textContent = "Available Missions";
+                titleP.appendChild(titleSpan);
+                header.appendChild(titleP);
 
-            if (missions.length === 0) {
-                let empty = document.createElement("p");
-                empty.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs";
-                empty.textContent = "No active missions for this zone.";
-                section.appendChild(empty);
-            } else {
-                let grouped = groupMissions(missions);
-                grouped.forEach(g => {
-                    let row = document.createElement("div");
-                    row.className = "c-kiAJIg c-kiAJIg-knmidH-justify-spaced";
-                    row.style.display = "flex";
-                    row.style.alignItems = "center";
-                    row.style.padding = "12px 0";
-                    row.style.gap = "14px";
-                    row.style.borderBottom = "1px solid rgba(255,255,255,0.06)";
+                let badge = document.createElement("span");
+                badge.style.fontSize = "11px";
+                badge.style.padding = "2px 8px";
+                badge.style.borderRadius = "10px";
+                badge.style.backgroundColor = missions.length > 0 ? "#1a6b3a" : "#5a5a6b";
+                badge.style.color = "#fff";
+                badge.style.flexShrink = "0";
+                badge.textContent = missions.length > 0 ? `${missions.length} active` : "None";
+                header.appendChild(badge);
 
-                    let info = document.createElement("div");
-                    info.className = "c-kiAJIg c-kiAJIg-iTKOFX-dir-v c-kiAJIg-kdofoX-spacing-xs";
+                section.appendChild(header);
 
-                    let nameEl = document.createElement("p");
-                    nameEl.className = "c-lbNOYO c-lbNOYO-kpetlT-variant-primary_body c-lbNOYO-dKdvLu-size-s c-lbNOYO-iqKmYR-weight-medium";
-                    let countLabel = g.count > 1 ? ` (×${g.count})` : "";
-                    nameEl.textContent = `${g.flight_plan_name}${countLabel}`;
-                    info.appendChild(nameEl);
+                // Show conversion rate info if applicable
+                if (missions.length > 0) {
+                    if (country === "CA" && usdcCadRate) {
+                        let rateInfo = document.createElement("p");
+                        rateInfo.style.fontSize = "11px";
+                        rateInfo.style.color = "#888";
+                        rateInfo.style.marginBottom = "4px";
+                        rateInfo.innerHTML = `1 USDC \u2248 <span style="color:rgb(255,204,0)">CA$${usdcCadRate.toFixed(4)}</span>`;
+                        section.appendChild(rateInfo);
+                    } else if (country === "US") {
+                        let rateInfo = document.createElement("p");
+                        rateInfo.style.fontSize = "11px";
+                        rateInfo.style.color = "#888";
+                        rateInfo.style.marginBottom = "4px";
+                        rateInfo.innerHTML = `1 USDC \u2248 <span style="color:rgb(100,200,100)">$1.00 USD</span>`;
+                        section.appendChild(rateInfo);
+                    }
+                }
 
-                    let rewardSpans = [];
-                    let cashStr = formatCurrency(g.totalAmount, g.currency);
-                    if (cashStr) rewardSpans.push(`<span>${cashStr}</span>`);
-                    if (g.totalUsdc > 0) {
-                        let usdcStr = g.totalUsdc.toFixed(2);
-                        rewardSpans.push(`<span>+${usdcStr} USDC</span>`);
-                        if (usdcCadRate) {
-                            let cadEquiv = (g.totalUsdc * usdcCadRate).toFixed(2);
-                            rewardSpans.push(`<span style="color:rgb(255,204,0)">≈ CA$${cadEquiv}</span>`);
+                if (missions.length === 0) {
+                    let empty = document.createElement("p");
+                    empty.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs";
+                    empty.textContent = "No active missions for this zone.";
+                    section.appendChild(empty);
+                } else {
+                    let grouped = groupMissions(missions);
+                    grouped.forEach(g => {
+                        let row = document.createElement("div");
+                        row.className = "c-kiAJIg c-kiAJIg-knmidH-justify-spaced";
+                        row.style.display = "flex";
+                        row.style.alignItems = "center";
+                        row.style.padding = "12px 0";
+                        row.style.gap = "14px";
+                        row.style.borderBottom = "1px solid rgba(255,255,255,0.06)";
+
+                        let info = document.createElement("div");
+                        info.className = "c-kiAJIg c-kiAJIg-iTKOFX-dir-v c-kiAJIg-kdofoX-spacing-xs";
+
+                        let nameEl = document.createElement("p");
+                        nameEl.className = "c-lbNOYO c-lbNOYO-kpetlT-variant-primary_body c-lbNOYO-dKdvLu-size-s c-lbNOYO-iqKmYR-weight-medium";
+                        let countLabel = g.count > 1 ? ` (\u00d7${g.count})` : "";
+                        nameEl.textContent = `${g.flight_plan_name}${countLabel}`;
+                        info.appendChild(nameEl);
+
+                        let rewardSpans = [];
+                        let cashStr = formatCurrency(g.totalAmount, g.currency);
+                        if (cashStr) rewardSpans.push(`<span>${cashStr}</span>`);
+                        if (g.totalUsdc > 0) {
+                            let usdcStr = g.totalUsdc.toFixed(2);
+                            rewardSpans.push(`<span>+${usdcStr} USDC</span>`);
+                            if (country === "CA" && usdcCadRate) {
+                                let cadEquiv = (g.totalUsdc * usdcCadRate).toFixed(2);
+                                rewardSpans.push(`<span style="color:rgb(255,204,0)">\u2248 CA$${cadEquiv}</span>`);
+                            } else if (country === "US") {
+                                let usdEquiv = g.totalUsdc.toFixed(2);
+                                rewardSpans.push(`<span style="color:rgb(100,200,100)">\u2248 $${usdEquiv} USD</span>`);
+                            }
                         }
-                    }
-                    if (g.totalRp > 0) rewardSpans.push(`<span style="color:#fff">+${g.totalRp} RP</span>`);
+                        if (g.totalRp > 0) rewardSpans.push(`<span style="color:#fff">+${g.totalRp} RP</span>`);
 
-                    if (rewardSpans.length > 0) {
-                        let rewardEl = document.createElement("p");
-                        rewardEl.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs c-lbNOYO-iqKmYR-weight-medium";
-                        rewardEl.style.color = "#88d8b0";
-                        rewardEl.innerHTML = rewardSpans.join("&nbsp;&nbsp;");
-                        info.appendChild(rewardEl);
-                    }
+                        if (rewardSpans.length > 0) {
+                            let rewardEl = document.createElement("p");
+                            rewardEl.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs c-lbNOYO-iqKmYR-weight-medium";
+                            rewardEl.style.color = "#88d8b0";
+                            rewardEl.innerHTML = rewardSpans.join("&nbsp;&nbsp;");
+                            info.appendChild(rewardEl);
+                        }
 
                     row.appendChild(info);
 
@@ -1472,6 +1502,7 @@
 
             // Also inject Failed/Taken flights into the Flight History section
             injectFailedTakenFlights(hash);
+            }); // end ratePromise.then
         });
     }
 
