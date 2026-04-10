@@ -2,7 +2,7 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      3.2.2
+// @version      3.3.0
 // @match        https://explorer.spexi.com/*
 // @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
@@ -1056,6 +1056,20 @@
         }
     }
 
+    async function fetchFlights(hash) {
+        try {
+            let resp = await fetch(`${API_BASE}/flights?zone_hash=${hash}`, {
+                credentials: "include",
+                headers: { "Content-Type": "application/json" }
+            });
+            if (!resp.ok) return [];
+            let json = await resp.json();
+            return json.data || [];
+        } catch (e) {
+            return [];
+        }
+    }
+
     function formatCurrency(amount, currency) {
         if (!amount || amount <= 0) return null;
         let sym = currency === "CAD" ? "CA$" : "$";
@@ -1088,6 +1102,188 @@
     }
 
     let _missionFetching = false;
+    let _flightsFetching = false;
+    let _flightsCache = { hash: null, flights: [] };
+
+    function formatFlightDate(dateStr) {
+        let d = new Date(dateStr);
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        return `${months[d.getMonth()]} ${String(d.getDate()).padStart(2, '0')}, ${d.getFullYear()}`;
+    }
+
+    const COMPACT_ROW_HEIGHT = 50;
+
+    function buildCompactFlightTR(flight, hash) {
+        // Create a <tr> matching the existing flight history row structure
+        let tr = document.createElement("tr");
+        tr.className = "c-cHCiJL c-gvgkRI";
+        tr.setAttribute("data-spexi-injected", "true");
+        tr.style.height = COMPACT_ROW_HEIGHT + "px";
+        tr.style.transform = "translateY(0px)";
+
+        let td = document.createElement("td");
+        td.className = "c-inedAR c-inedAR-cmVlgk-hAlign-left c-inedAR-goqZZF-vAlign-center";
+
+        // Outer card — same classes as existing entries
+        let card = document.createElement("div");
+        card.className = "c-FNXti c-FNXti-hVCjZQ-background-darken c-FNXti-kEvnuF-padding-s";
+
+        // Layout row: info left, status badge right — same as existing entries
+        let row = document.createElement("div");
+        row.className = "c-kiAJIg c-kiAJIg-JrrAq-align-start c-kiAJIg-knmidH-justify-spaced";
+
+        // Info column — same classes as existing entries
+        let info = document.createElement("div");
+        info.className = "c-kiAJIg c-kiAJIg-iTKOFX-dir-v c-kiAJIg-fVlWzK-spacing-s c-kiAJIg-ibPNjhd-css";
+
+        // Compact single line with date, pilot, and ID
+        let datePilot = document.createElement("p");
+        datePilot.className = "c-lbNOYO c-lbNOYO-kpetlT-variant-primary_body c-lbNOYO-dKdvLu-size-s c-lbNOYO-iqKmYR-weight-medium c-lbNOYO-ihTrFnY-css";
+        let dateStr = formatFlightDate(flight.created_at);
+        let pilot = flight.username || "Unknown";
+        datePilot.textContent = `${dateStr}`;
+        info.appendChild(datePilot);
+
+        let pilotLine = document.createElement("p");
+        pilotLine.className = "c-lbNOYO c-lbNOYO-deQLyJ-variant-secondary_body c-lbNOYO-fsvfVm-size-xs c-lbNOYO-ihTrFnY-css";
+        pilotLine.textContent = `Pilot: ${pilot}  ·  ID: ${flight.id}`;
+        info.appendChild(pilotLine);
+
+        row.appendChild(info);
+
+        // Status badge — uses same class as existing entries (c-bvgJZe)
+        let statusBadge = document.createElement("p");
+        statusBadge.className = "c-bvgJZe";
+        statusBadge.textContent = flight.status.toLowerCase();
+        statusBadge.style.color = "#ED3232";
+        statusBadge.style.borderColor = "#ED3232";
+        row.appendChild(statusBadge);
+
+        card.appendChild(row);
+        td.appendChild(card);
+        tr.appendChild(td);
+        return tr;
+    }
+
+    function parseRowDate(tr) {
+        // Extract the date text from an existing flight history <tr>
+        // The first <p> with the primary_body variant class contains the date like "Dec 20, 2025"
+        let dateEl = tr.querySelector(".c-lbNOYO-kpetlT-variant-primary_body");
+        if (dateEl) {
+            let d = new Date(dateEl.textContent.trim());
+            if (!isNaN(d.getTime())) return d;
+        }
+        return null;
+    }
+
+    function renderExtraFlightsDOM(extraFlights, hash) {
+        // Remove any previously injected rows
+        document.querySelectorAll('tr[data-spexi-injected]').forEach(el => el.remove());
+
+        if (extraFlights.length === 0) return;
+
+        // Find the Flight History table's <tbody>
+        let historyHeader = null;
+        let walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        let textNode;
+        while (textNode = walker.nextNode()) {
+            if (textNode.textContent.trim() === "Flight History") {
+                historyHeader = textNode.parentElement;
+                break;
+            }
+        }
+
+        if (!historyHeader) return;
+
+        // Walk up to find the container with the table
+        let historyContainer = historyHeader;
+        for (let i = 0; i < 10 && historyContainer; i++) {
+            if (historyContainer.querySelector && historyContainer.querySelector("table")) {
+                break;
+            }
+            historyContainer = historyContainer.parentElement;
+        }
+
+        if (!historyContainer) return;
+
+        let tbody = historyContainer.querySelector("tbody");
+        if (!tbody) return;
+
+        // Get existing rows and their dates
+        let existingRows = Array.from(tbody.querySelectorAll("tr:not([data-spexi-injected])"));
+        let existingDates = existingRows.map(tr => ({ tr, date: parseRowDate(tr) }));
+
+        // Insert each extra flight in chronological order (descending — newest first)
+        let addedHeight = 0;
+        for (let flight of extraFlights) {
+            let flightDate = new Date(flight.created_at);
+            let newTR = buildCompactFlightTR(flight, hash);
+            let inserted = false;
+
+            // Find the correct position: insert before the first existing row with an older date
+            for (let i = 0; i < existingDates.length; i++) {
+                if (existingDates[i].date && flightDate > existingDates[i].date) {
+                    tbody.insertBefore(newTR, existingDates[i].tr);
+                    // Update the list so subsequent inserts are aware of this new row
+                    existingDates.splice(i, 0, { tr: newTR, date: flightDate });
+                    inserted = true;
+                    break;
+                }
+            }
+
+            if (!inserted) {
+                // Flight is older than all existing rows — append at end
+                tbody.appendChild(newTR);
+                existingDates.push({ tr: newTR, date: flightDate });
+            }
+            addedHeight += COMPACT_ROW_HEIGHT;
+        }
+
+        // Adjust the table height container to accommodate the new rows
+        let heightDiv = historyContainer.querySelector("div[style*='height:']") ||
+                        historyContainer.querySelector("[data-radix-scroll-area-viewport] > div > div[style*='height']");
+        if (heightDiv && heightDiv.style.height) {
+            let currentHeight = parseInt(heightDiv.style.height, 10);
+            if (!isNaN(currentHeight)) {
+                heightDiv.style.height = (currentHeight + addedHeight) + "px";
+            }
+        }
+    }
+
+    function hasInjectedFlightRows() {
+        return document.querySelector('tr[data-spexi-injected]') !== null;
+    }
+
+    function injectFailedTakenFlights(hash) {
+        // Remove any previously injected rows
+        document.querySelectorAll('tr[data-spexi-injected]').forEach(el => el.remove());
+        if (_flightsFetching) return;
+
+        // If we already have cached data for this hash, just render from cache
+        if (_flightsCache.hash === hash && _flightsCache.flights.length > 0) {
+            renderExtraFlightsDOM(_flightsCache.flights, hash);
+            return;
+        }
+
+        _flightsFetching = true;
+        fetchFlights(hash).then(flights => {
+            _flightsFetching = false;
+            let extraFlights = flights.filter(f => {
+                let s = f.status?.toLowerCase();
+                return s === "failed" || s === "taken";
+            });
+
+            // Sort by created_at descending (most recent first)
+            extraFlights.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            // Cache the filtered results
+            _flightsCache = { hash, flights: extraFlights };
+
+            renderExtraFlightsDOM(extraFlights, hash);
+        }).catch(() => {
+            _flightsFetching = false;
+        });
+    }
 
     function injectMissionList(hash) {
         let existing = document.getElementById("spexi-missions-section");
@@ -1259,6 +1455,9 @@
             if (!inserted) {
                 // Silently fail if insertion points aren't found
             }
+
+            // Also inject Failed/Taken flights into the Flight History section
+            injectFailedTakenFlights(hash);
         });
     }
 
@@ -1275,7 +1474,23 @@
     function onZoneChange(hash) {
         if (!hash) return;
         lastZoneHash = hash;
+        _flightsCache = { hash: null, flights: [] }; // invalidate cache for new zone
         injectMissionList(hash);
+    }
+
+    function checkForExtraFlightsReinjection() {
+        let hash = getCurrentZoneHash();
+        if (hash && _flightsCache.hash === hash && _flightsCache.flights.length > 0 && !hasInjectedFlightRows()) {
+            // Only re-render from cache — never re-fetch from the observer
+            let walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let textNode;
+            while (textNode = walker.nextNode()) {
+                if (textNode.textContent.trim() === "Flight History") {
+                    renderExtraFlightsDOM(_flightsCache.flights, hash);
+                    return;
+                }
+            }
+        }
     }
 
     function checkForZoneChange() {
@@ -1292,6 +1507,7 @@
     const observer = new MutationObserver(() => {
         injectUI();
         checkForZoneChange();
+        checkForExtraFlightsReinjection();
     });
 
     function startObserving() {
