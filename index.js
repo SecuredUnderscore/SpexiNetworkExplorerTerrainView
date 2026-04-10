@@ -2,7 +2,7 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      3.3.0
+// @version      3.4.0
 // @match        https://explorer.spexi.com/*
 // @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
@@ -1070,6 +1070,20 @@
         }
     }
 
+    async function fetchZoneInfo(hash) {
+        try {
+            let resp = await fetch(`${API_BASE}/zones/${hash}`, {
+                credentials: "include",
+                headers: { "Content-Type": "application/json" }
+            });
+            if (!resp.ok) return null;
+            let json = await resp.json();
+            return json.data || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     function formatCurrency(amount, currency) {
         if (!amount || amount <= 0) return null;
         let sym = currency === "CAD" ? "CA$" : "$";
@@ -1462,6 +1476,140 @@
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
+    // Reservation Timer
+    // ─────────────────────────────────────────────────────────────────────────────
+    const RESERVATION_DURATION_MS = 48 * 60 * 60 * 1000; // 48 hours
+    let _reservationTimerInterval = null;
+    let _reservationCache = { hash: null, data: null, fetching: false };
+
+    function formatCountdown(ms) {
+        if (ms <= 0) return "0s";
+        let totalSec = Math.floor(ms / 1000);
+        let h = Math.floor(totalSec / 3600);
+        let m = Math.floor((totalSec % 3600) / 60);
+        let s = totalSec % 60;
+        if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+        if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
+        return `${s}s`;
+    }
+
+    function clearReservationTimer() {
+        if (_reservationTimerInterval) {
+            clearInterval(_reservationTimerInterval);
+            _reservationTimerInterval = null;
+        }
+        let existing = document.getElementById("spexi-reservation-timer");
+        if (existing) existing.remove();
+    }
+
+    function injectReservationTimer(hash) {
+        // Don't inject if there's already a native Reserve button
+        let buttons = Array.from(document.querySelectorAll("button"));
+        let reserveBtn = buttons.find(b => b.innerText && b.innerText.trim() === "Reserve Zone");
+        if (reserveBtn) return;
+
+        // Don't inject if timer already exists
+        if (document.getElementById("spexi-reservation-timer")) return;
+
+        // Guard: don't re-fetch if already fetching
+        if (_reservationCache.fetching) return;
+
+        // Use cached data if available for this hash
+        if (_reservationCache.hash === hash && _reservationCache.data !== null) {
+            renderReservationTimerFromData(_reservationCache.data, hash);
+            return;
+        }
+
+        _reservationCache.fetching = true;
+        fetchZoneInfo(hash).then(zoneData => {
+            _reservationCache = { hash, data: zoneData, fetching: false };
+            renderReservationTimerFromData(zoneData, hash);
+        }).catch(() => {
+            _reservationCache.fetching = false;
+        });
+    }
+
+    function renderReservationTimerFromData(zoneData, hash) {
+        if (!zoneData || !zoneData.reservation) return;
+        let reservation = zoneData.reservation;
+        if (reservation.status !== "active") return;
+
+        let createdAt = new Date(reservation.created_at).getTime();
+        let expiresAt = createdAt + RESERVATION_DURATION_MS;
+        let now = Date.now();
+
+        // If already expired, no timer needed
+        if (now >= expiresAt) return;
+
+        // Don't inject if native Reserve button appeared
+        let buttons = Array.from(document.querySelectorAll("button"));
+        let reserveBtn = buttons.find(b => b.innerText && b.innerText.trim() === "Reserve Zone");
+        if (reserveBtn) return;
+
+        // Don't duplicate
+        if (document.getElementById("spexi-reservation-timer")) return;
+
+        // Find the bottom bar container (where Google Maps and Download buttons are)
+        let gmapBtn = buttons.find(b => b.innerText && b.innerText.includes("View in Google Maps"));
+        if (!gmapBtn) return;
+
+        let bottomBar = gmapBtn.parentElement;
+        if (!bottomBar) return;
+
+        // Create the timer button — same classes as the native Reserve Zone button
+        let timerBtn = document.createElement("button");
+        timerBtn.id = "spexi-reservation-timer";
+        timerBtn.className = "c-kSHLrh c-kSHLrh-dXpgym-variant-primary_outline c-kSHLrh-fyQYCy-size-s PJLV";
+        timerBtn.type = "button";
+        timerBtn.style.cursor = "default";
+        timerBtn.style.opacity = "0.7";
+        timerBtn.title = "This button will become available when the current reservation expires";
+
+        let innerDiv = document.createElement("div");
+        innerDiv.className = "c-kiAJIg c-kiAJIg-jroWjL-align-center c-kiAJIg-bICGYT-justify-center c-kiAJIg-ejCoEP-dir-h c-kiAJIg-kdofoX-spacing-xs";
+
+        let remaining = expiresAt - Date.now();
+        innerDiv.textContent = `⏳ ${formatCountdown(remaining)}`;
+
+        timerBtn.appendChild(innerDiv);
+        bottomBar.appendChild(timerBtn);
+
+        // Clear any existing interval
+        if (_reservationTimerInterval) clearInterval(_reservationTimerInterval);
+
+        // Start countdown
+        _reservationTimerInterval = setInterval(() => {
+            let remaining = expiresAt - Date.now();
+            if (remaining <= 0) {
+                clearInterval(_reservationTimerInterval);
+                _reservationTimerInterval = null;
+                // Timer expired — reload so the native Reserve button appears
+                innerDiv.textContent = "Reserve Zone";
+                timerBtn.style.cursor = "pointer";
+                timerBtn.style.opacity = "1";
+                timerBtn.title = "Reservation expired — click to refresh";
+                timerBtn.onclick = () => location.reload();
+            } else {
+                innerDiv.textContent = `⏳ ${formatCountdown(remaining)}`;
+            }
+        }, 1000);
+    }
+
+    function checkReservationTimerReinjection() {
+        let hash = getCurrentZoneHash();
+        if (!hash) return;
+        // Only re-inject if we have cached data and the timer element is missing
+        if (_reservationCache.hash === hash && _reservationCache.data && !document.getElementById("spexi-reservation-timer")) {
+            // Check that the bottom bar exists
+            let buttons = Array.from(document.querySelectorAll("button"));
+            let gmapBtn = buttons.find(b => b.innerText && b.innerText.includes("View in Google Maps"));
+            if (gmapBtn) {
+                renderReservationTimerFromData(_reservationCache.data, hash);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
     // Zone Change Detection & Initialization
     // ─────────────────────────────────────────────────────────────────────────────
     let lastZoneHash = null;
@@ -1475,7 +1623,10 @@
         if (!hash) return;
         lastZoneHash = hash;
         _flightsCache = { hash: null, flights: [] }; // invalidate cache for new zone
+        clearReservationTimer();
+        _reservationCache = { hash: null, data: null, fetching: false }; // invalidate reservation cache
         injectMissionList(hash);
+        injectReservationTimer(hash);
     }
 
     function checkForExtraFlightsReinjection() {
@@ -1508,6 +1659,7 @@
         injectUI();
         checkForZoneChange();
         checkForExtraFlightsReinjection();
+        checkReservationTimerReinjection();
     });
 
     function startObserving() {
