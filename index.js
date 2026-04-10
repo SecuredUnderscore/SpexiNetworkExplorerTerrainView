@@ -2,7 +2,7 @@
 // @name         Spexi Network Explorer Tools
 // @author       Secured_ on Discord
 // @namespace    http://tampermonkey.net/
-// @version      3.2.1
+// @version      3.2.2
 // @match        https://explorer.spexi.com/*
 // @require      https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js
@@ -237,17 +237,19 @@
             let startOffset = spacingDeg < totalHeight ? remainder / 2 : totalHeight / 2;
 
             let scanLines = [];
-            let lastEndpoint = null;
+            let accumulatedCoords = []; // Flat array of endpoint coords, like app's _closure3_slot1
             let y = min_y + startOffset;
 
             while (y <= max_y) {
-                let scanLine = turf.lineString([[min_x - 0.001, y], [max_x + 0.001, y]]);
+                let scanLineStart = [min_x - 0.001, y];
+                let scanLineEnd = [max_x + 0.001, y];
+                let scanLine = turf.lineString([scanLineStart, scanLineEnd]);
                 // Cut line by polygon
                 let segments = [];
                 try {
                     let split = turf.lineSplit(scanLine, rotatedPoly);
                     if (!split || split.features.length === 0) {
-                        let mid = turf.midpoint(scanLine.geometry.coordinates[0], scanLine.geometry.coordinates[1]);
+                        let mid = turf.midpoint(scanLineStart, scanLineEnd);
                         if (turf.booleanPointInPolygon(mid, rotatedPoly)) segments.push(scanLine.geometry.coordinates);
                     } else {
                         for (let feat of split.features) {
@@ -260,18 +262,37 @@
 
                 for (let segCoords of segments) {
                     if (segCoords.length >= 2) {
-                        // Reverse initially (like App DESC sort)
-                        segCoords.reverse();
-                        if (gimbalPitch === -90) {
-                            if (scanLines.length % 2 !== 0) segCoords.reverse();
-                        } else {
-                            if (lastEndpoint) {
-                                let dFwd = Math.pow(segCoords[0][0] - lastEndpoint[0], 2) + Math.pow(segCoords[0][1] - lastEndpoint[1], 2);
-                                let dRev = Math.pow(segCoords[segCoords.length - 1][0] - lastEndpoint[0], 2) + Math.pow(segCoords[segCoords.length - 1][1] - lastEndpoint[1], 2);
-                                if (dRev < dFwd) segCoords.reverse();
+                        // Step 1: Sort segment endpoints by distance from scan line start (DESCENDING)
+                        // App comparator returns (dist_a1 - dist_a0), putting farthest-from-left first
+                        let startRef = scanLineStart;
+                        segCoords.sort((a, b) => {
+                            let dA = distanceMeters(startRef, a);
+                            let dB = distanceMeters(startRef, b);
+                            return dB - dA;
+                        });
+
+                        // Step 2: Keep only the two endpoints (first and last)
+                        // This matches the app's splice(1, length-2)
+                        if (segCoords.length > 2) {
+                            segCoords = [segCoords[0], segCoords[segCoords.length - 1]];
+                        }
+
+                        // Step 3: Direction logic based on accumulated state
+                        if (accumulatedCoords.length > 0) {
+                            if (gimbalPitch === -90) {
+                                // Nadir: sort by proximity to last accumulated point
+                                let lastPt = accumulatedCoords[accumulatedCoords.length - 1];
+                                let d0 = distanceMeters(lastPt, segCoords[0]);
+                                let d1 = distanceMeters(lastPt, segCoords[segCoords.length - 1]);
+                                if (d1 < d0) segCoords.reverse();
+                            } else {
+                                // Non-nadir: alternate based on accumulated line count
+                                let lineCount = accumulatedCoords.length / 2;
+                                if (lineCount % 2 !== 0) segCoords.reverse();
                             }
                         }
-                        lastEndpoint = segCoords[segCoords.length - 1];
+
+                        accumulatedCoords.push(segCoords[0], segCoords[segCoords.length - 1]);
                         scanLines.push(segCoords);
                     }
                 }
